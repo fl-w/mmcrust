@@ -1,0 +1,14 @@
+int main() {
+    int x = 2;
+    int f() { x = 4; }
+
+    int z() {
+        int b() {
+            x = 2;
+        }
+
+        b();
+    }
+
+    z();
+}
