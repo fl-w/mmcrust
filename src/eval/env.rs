@@ -4,9 +4,11 @@ use super::{EvalError, EvalResult, Object};
 
 pub type EnvScope = usize;
 
+pub const GLOBAL_SCOPE: EnvScope = 0;
+
 #[derive(Debug, PartialEq, Default)]
 pub struct Frame {
-    extend_scope: EnvScope,
+    extends: EnvScope,
     bindings: HashMap<String, Object>,
 }
 
@@ -17,7 +19,6 @@ impl Frame {
 #[derive(Debug, PartialEq)]
 pub struct Env {
     frames: Vec<Frame>,
-    // if next
     declare_next: bool,
 }
 
@@ -39,7 +40,7 @@ impl Env {
 
     pub fn extend(&mut self, extend_scope: EnvScope) {
         self.frames.push(Frame {
-            extend_scope,
+            extends: extend_scope,
             bindings: HashMap::new(),
         });
     }
@@ -48,16 +49,16 @@ impl Env {
 
     pub fn declare_next(&mut self) { self.declare_next = true; }
 
+    pub fn declare(&mut self, key: String, value: Object) {
+        self.frames.last_mut().unwrap().bindings.insert(key, value);
+    }
+
     pub fn set(&mut self, key: String, value: Object) -> EvalResult {
         if self.declare_next {
             self.declare_next = false;
-            Ok(self
-                .frames
-                .last_mut()
-                .unwrap()
-                .bindings
-                .insert(key, value)
-                .unwrap_or(Object::Void))
+            self.declare(key, value);
+
+            Ok(Object::Void)
         } else if let Some(var) = self.get_mut(&key) {
             let prev = var.clone();
             *var = value;
@@ -69,42 +70,30 @@ impl Env {
 
     pub fn get(&self, key: &str) -> Option<&Object> { self.get_in_scope(key, self.current_scope()) }
 
+    pub fn get_in_scope(&self, key: &str, scope: EnvScope) -> Option<&Object> {
+        self.find_from_scope(key, scope)
+            .map(|scope| self.frames[scope].bindings.get(key).unwrap())
+    }
+
     pub fn get_mut(&mut self, key: &str) -> Option<&mut Object> {
         self.get_mut_in_scope(key, self.current_scope())
     }
 
-    pub fn get_mut_in_scope<'a>(
-        &'a mut self,
-        key: &str,
-        scope: EnvScope,
-    ) -> Option<&'a mut Object> {
-        let acm = 0;
-        self.frames.iter().nth
-        if let Some(ref mut frame) = self.frames.get_mut(scope) {
-            let v = frame.bindings.get_mut(key);
-            if v.is_some() {
-                v
-            } else {
-                if frame.extend_scope == scope {
-                    None
-                } else {
-                    self.get_mut_in_scope(key, frame.extend_scope)
-                }
-            }
+    pub fn get_mut_in_scope(&mut self, key: &str, scope: EnvScope) -> Option<&mut Object> {
+        if let Some(scope) = self.find_from_scope(key, scope) {
+            self.frames[scope].bindings.get_mut(key)
         } else {
             None
         }
     }
 
-    pub fn get_in_scope(&self, key: &str, scope: EnvScope) -> Option<&Object> {
-        self.frames.get(scope).and_then(|frame| {
-            frame.bindings.get(key).or_else(|| {
-                if frame.extend_scope == scope {
-                    None
-                } else {
-                    self.get_in_scope(key, frame.extend_scope)
-                }
-            })
+    fn find_from_scope(&self, key: &str, scope: EnvScope) -> Option<EnvScope> {
+        self.frames.get(scope).and_then(|frame: &Frame| {
+            if frame.bindings.contains_key(key) {
+                Some(scope)
+            } else {
+                None
+            }
         })
     }
 }

@@ -1,103 +1,12 @@
 pub mod builtins;
 pub mod env;
+pub mod object;
 
-use std::{
-    convert::TryInto,
-    ffi::CStr,
-    fmt,
-    os::raw::{c_char, c_int},
-};
+use std::{convert::TryInto, ffi::CStr, fmt, os::raw::c_int};
 
-use log::trace;
-use parser::{self, Infix, Node, NodePtr, YYTokenType};
-
-use self::env::Env;
-use self::{builtins::Builtin, env::EnvScope};
-
-#[derive(PartialEq, Clone)]
-pub enum Object {
-    Int(c_int),
-    Bool(bool),
-    Str(String),
-    Ident(String),
-    Closure(Closure),
-    Function(String, Closure),
-    BuiltinFunction(Builtin),
-    Void,
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct Closure {
-    head: NodePtr,
-    scope: EnvScope,
-    return_type: String,
-    parameters: Vec<String>,
-}
-
-pub type TypeName = String;
-
-impl Object {
-    pub fn type_name(&self) -> TypeName {
-        match self {
-            Self::Int(_) => "int",
-            Self::Str(_) => "str",
-            Self::Ident(_) => "var",
-            Self::Void => "void",
-            Self::Bool(_) => "bool",
-            Self::Closure(_) => "function <closure>",
-            Self::BuiltinFunction(_) => "built-in",
-            Self::Function(_, _) => "function",
-        }
-        .to_owned()
-    }
-
-    pub fn truthy(&self) -> Option<bool> {
-        match self {
-            Self::Void => Some(false),
-            Self::Int(i) => Some(i != &0),
-            Self::Bool(b) => Some(*b),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Debug for Object {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Object::Str(string) => write!(f, "\"{}\"", string),
-            Object::BuiltinFunction((name, _)) => write!(f, "<{}>", name),
-            Object::Ident(value) => write!(f, "<ident {}>", value),
-            Object::Function(name, cl) => {
-                write!(f, "<{} {} at {:?}>", self.type_name(), name, cl.head)
-            }
-            Object::Closure(cl) => {
-                write!(f, "<{} at {:?}>", self.type_name(), cl.head)
-            }
-
-            _ => write!(f, "{}", self),
-        }
-    }
-}
-
-impl fmt::Display for Object {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Object::Int(value) => write!(f, "{}", value),
-            Object::Bool(value) => write!(f, "{}", value),
-            Object::Str(value) => write!(f, "{}", value),
-            Object::Void => write!(f, "void"),
-            _ => write!(f, "{:?}", self),
-        }
-    }
-}
-
-// impl From<YYTokenType> for Object {
-//     fn from(token_type: YYTokenType) -> Self {
-//         match token_type {
-//             _ => Object::Int(0),
-//         }
-//     }
-// }
+use itertools::Itertools;
+use log::{debug, trace};
+use parser::{self, cstr_to_string, Infix, Node, NodePtr, YYTokenType};
 
 pub type EvalResult = Result<Object, EvalError>;
 
@@ -159,27 +68,11 @@ impl fmt::Display for EvalError {
     }
 }
 
-fn cstr_to_string(ptr: *const c_char) -> String {
-    unsafe { CStr::from_ptr(ptr).to_string_lossy().to_owned().to_string() }
-}
-
 fn eval_args(param: NodePtr, env: &mut Env) -> Result<Vec<Object>, EvalError> {
-    let mut parameter_list = vec![];
-    let mut param = param;
-
-    while !parser::node_ptr_null(param) {
-        let node = unsafe { param.as_mut().unwrap() };
-
-        if let YYTokenType::Comma = node.type_.try_into().unwrap() {
-            parameter_list.push(eval_value(node.left, env)?);
-            param = node.right;
-        } else {
-            parameter_list.push(eval_value(param, env)?);
-            break;
-        };
-    }
-
-    Ok(parameter_list)
+    parser::parse_args(param)
+        .into_iter()
+        .map(|node: NodePtr| eval_value(node, env))
+        .collect()
 }
 
 fn eval_conditional(node: Node, env: &mut Env) -> EvalResult {
@@ -197,15 +90,21 @@ fn eval_conditional(node: Node, env: &mut Env) -> EvalResult {
     }
 }
 
-pub fn eval_function_call(func: Object, args: Vec<Object>, env: &mut Env) -> EvalResult {
-    trace!("calling function with name = {}, args = {:?}", func, args);
+fn eval_ident(ident: String, env: &Env) -> EvalResult {
+    env.get(&ident)
+        .map(Clone::clone)
+        .or_else(|| builtins::lookup(&ident))
+        .ok_or(EvalError::UnboundVariable(ident))
+}
+
+pub fn eval_fn_call(func: Object, args: Vec<Object>, env: &mut Env) -> EvalResult {
+    trace!("(eval) calling {} with {:?}", func, args);
 
     match func {
-        Object::Closure(closure) => eval_closure(closure, args, env),
+        Object::Closure(scope, closure) => eval_fn(closure, scope, args, env),
         Object::Str(ident) | Object::Ident(ident) => match eval_ident(ident, env)? {
-            Object::Function(_, closure) | Object::Closure(closure) => {
-                eval_closure(closure, args, env)
-            }
+            Object::Function(fnc) => eval_fn(fnc, env::GLOBAL_SCOPE, args, env),
+            Object::Closure(scope, fnc) => eval_fn(fnc, scope, args, env),
             Object::BuiltinFunction(builtin) => builtins::eval(builtin, args),
             obj => Err(EvalError::NotCallable(obj.type_name())),
         },
@@ -214,22 +113,22 @@ pub fn eval_function_call(func: Object, args: Vec<Object>, env: &mut Env) -> Eva
     }
 }
 
-fn eval_ident(ident: String, env: &Env) -> EvalResult {
-    env.get(&ident)
-        .map(Clone::clone)
-        .or_else(|| builtins::lookup(&ident))
-        .ok_or(EvalError::UnboundVariable(ident))
-}
+fn eval_fn(
+    closure: CompiledFunction,
+    scope: EnvScope,
+    args: Vec<Object>,
+    env: &mut Env,
+) -> EvalResult {
+    debug!("(eval) {} {:?}", scope, closure);
 
-fn eval_closure(closure: Closure, args: Vec<Object>, env: &mut Env) -> EvalResult {
-    env.extend(closure.scope);
+    env.extend(scope);
 
     for (param, arg) in closure.parameters.into_iter().zip(args.into_iter()) {
         env.declare_next();
         env.set(param, arg);
     }
 
-    let rs = eval_return_tree(closure.head, &mut env);
+    let rs = eval_return_tree(closure.head, env);
 
     env.drop_frame();
 
@@ -270,40 +169,6 @@ fn eval_block(block: Node, env: &mut Env) -> EvalResult {
 }
 
 /// Given a function definition node, return the function name and list of parameter names.
-fn parse_function_def(node: Node) -> (String, Vec<String>) {
-    let parse_parameter = |pnode: Node| match pnode.token_type() {
-        Some(YYTokenType::LEAF) => pnode.as_string().unwrap(),
-        Some(YYTokenType::Declaration) => pnode.right_node().unwrap().as_string().unwrap(),
-        _ => unreachable!(),
-    };
-
-    let mut parameter_list = vec![];
-    let mut parameter_node = node.right_node();
-
-    // node F: left child is the name of the function, right is the function parameters
-    let function_name = node.left_node().and_then(|node| node.as_string()).unwrap();
-    while let Some(pnode) = parameter_node {
-        match pnode.token_type() {
-            Some(YYTokenType::Comma) => {
-                parameter_list.insert(0, parse_parameter(pnode.right_node().unwrap()));
-                parameter_node = pnode.left_node();
-            }
-
-            Some(_) => {
-                parameter_list.insert(0, parse_parameter(pnode));
-                break;
-            }
-
-            None => break,
-        }
-    }
-
-    (
-        function_name,
-        parameter_list.drain_filter(|s| !s.is_empty()).collect(),
-    )
-}
-
 fn eval_return_tree(tree: NodePtr, env: &mut Env) -> EvalResult {
     let result = eval_value(tree, env);
 
@@ -328,37 +193,43 @@ pub fn eval_value(node: NodePtr, env: &mut Env) -> EvalResult {
     }
 }
 
-fn _trace_tree(tree: NodePtr, node: Node) {
-    let name = unsafe { CStr::from_ptr(parser::named(node.type_)) }
-        .to_str()
-        .unwrap();
+fn _trace_tree(ptr: &NodePtr, node: &Node, token: &YYTokenType) {
     trace!(
-        "eval ({})> {} :: ({}, {}, {})",
-        node.type_,
-        name,
-        parser::node_ptr_null(tree),
-        parser::node_ptr_null(node.left),
-        parser::node_ptr_null(node.right),
+        "evaluating tree at {:?} with token {:?} ({})",
+        ptr,
+        token,
+        node.type_
     );
+    // let name = unsafe { CStr::from_ptr(parser::named(node.type_)) }
+    // .unwrap();
+    // trace!(
+    // "eval ({})> {} :: ({}, {}, {})",
+    // node.type_,
+    // name,
+    // parser::node_ptr_null(tree),
+    // parser::node_ptr_null(node.left),
+    // parser::node_ptr_null(node.right),
+    // );
 }
 
-pub fn eval_tree(tree: NodePtr, env: &mut Env) -> EvalResult {
-    if let Ok(node) = tree.try_into() as Result<Node, ()> {
-        _trace_tree(tree, node);
+pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
+    if let Some((node, Some(token))) = Node::deref_node_and_token(ptr) {
+        _trace_tree(&ptr, &node, &token);
 
-        match node
-            .token_type()
-            .ok_or(EvalError::ParseError(node.type_ as i32))? as YYTokenType
-        {
+        match token {
             YYTokenType::LEAF => eval_tree(node.left, env),
 
             YYTokenType::RETURN => Err(EvalError::Return(eval_value(node.left, env)?)),
 
             YYTokenType::CONSTANT => Ok(Object::Int(node.as_cint().unwrap())),
 
-            YYTokenType::STRING_LITERAL => Ok(Object::Str(cstr_to_string(node.as_cstr().unwrap()))),
+            YYTokenType::STRING_LITERAL => Ok(Object::Str(unsafe {
+                cstr_to_string(node.as_cstr().unwrap())
+            })),
 
-            YYTokenType::IDENTIFIER => Ok(Object::Ident(cstr_to_string(node.as_cstr().unwrap()))),
+            YYTokenType::IDENTIFIER => Ok(Object::Ident(unsafe {
+                cstr_to_string(node.as_cstr().unwrap())
+            })),
 
             YYTokenType::IF => eval_conditional(node, env),
 
@@ -369,20 +240,23 @@ pub fn eval_tree(tree: NodePtr, env: &mut Env) -> EvalResult {
             YYTokenType::D => match node.left_node_and_token() {
                 Some((def, YYTokenType::d)) => {
                     let return_type = def.left_node().and_then(Node::as_string).unwrap();
-                    let (function_name, parameters) = parse_function_def(def.right_node().unwrap());
+                    let (name, parameters) = parser::parse_fn(def.right_node().unwrap());
 
-                    let closure = Closure {
+                    let scope = env.current_scope();
+                    let fnc = CompiledFunction {
                         head: node.right,
-                        scope: env.current_scope(),
+                        name,
                         return_type,
                         parameters,
                     };
 
-                    env.set(
-                        function_name.clone(),
-                        Object::Function(function_name, closure),
-                    );
+                    let fnc = if scope == env::GLOBAL_SCOPE {
+                        Object::Function(fnc)
+                    } else {
+                        Object::Closure(scope, fnc)
+                    };
 
+                    env.declare(name.clone(), fnc);
                     Ok(Object::Void)
                 }
                 _ => Err(EvalError::ParseError(2)),
@@ -398,7 +272,7 @@ pub fn eval_tree(tree: NodePtr, env: &mut Env) -> EvalResult {
                 let func_name = eval_tree(node.left, env)?;
                 let args = eval_args(node.right, env)?;
 
-                eval_function_call(func_name, args, env)
+                eval_fn_call(func_name, args, env)
             }
 
             // A variable or a function declaration (~)
@@ -474,14 +348,14 @@ pub fn eval_repl(input: &str, env: &mut Env) -> EvalResult {
     let ast = parser::parse_str(input.as_str()).unwrap();
     let obj = eval_tree(ast, env)?;
 
-    eval_function_call(obj, vec![], env)
+    eval_fn_call(obj, vec![], env)
 }
 
 pub fn eval_source_tree(tree_root: NodePtr) -> EvalResult {
     let env = &mut Env::new();
 
     eval_tree(tree_root, env)
-        .and_then(|_| eval_function_call(Object::Ident("main".to_owned()), vec![], env))
+        .and_then(|_| eval_fn_call(Object::Ident("main".to_owned()), vec![], env))
 }
 
 #[cfg(test)]

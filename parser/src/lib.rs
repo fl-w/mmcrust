@@ -260,3 +260,58 @@ impl TryFrom<NodePtr> for YYTokenType {
         }
     }
 }
+
+pub unsafe fn cstr_to_string(ptr: *const c_char) -> String {
+    CStr::from_ptr(ptr).to_string_lossy().to_owned().to_string()
+}
+
+pub fn parse_fn(node: Node) -> (String, Vec<String>) {
+    let parse_parameter = |pnode: Node| match pnode.token_type() {
+        Some(YYTokenType::LEAF) => pnode.as_string().unwrap(),
+        Some(YYTokenType::Declaration) => pnode.right_node().unwrap().as_string().unwrap(),
+        _ => unreachable!(),
+    };
+
+    let mut parameter_list = vec![];
+    let mut parameter_node = node.right_node();
+
+    // node F: left child is the name of the function, right is the function parameters
+    let function_name = node.left_node().and_then(|node| node.as_string()).unwrap();
+    while let Some(pnode) = parameter_node {
+        match pnode.token_type() {
+            Some(YYTokenType::Comma) => {
+                parameter_list.insert(0, parse_parameter(pnode.right_node().unwrap()));
+                parameter_node = pnode.left_node();
+            }
+
+            Some(_) => {
+                parameter_list.insert(0, parse_parameter(pnode));
+                break;
+            }
+
+            None => break,
+        }
+    }
+
+    parameter_list.retain(|s| !s.is_empty());
+
+    (function_name, parameter_list)
+}
+
+pub fn parse_args(param: NodePtr) -> Vec<NodePtr> {
+    let mut arg_list = vec![];
+    let mut param = param;
+
+    while !node_ptr_null(param) {
+        let node = unsafe { param.as_mut().unwrap() };
+
+        if let YYTokenType::Comma = node.type_.try_into().unwrap() {
+            arg_list.push(node.left);
+            param = node.right;
+        } else {
+            arg_list.push(param);
+        };
+    }
+
+    arg_list
+}

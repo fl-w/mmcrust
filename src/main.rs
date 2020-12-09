@@ -1,11 +1,12 @@
 #![feature(or_patterns, in_band_lifetimes, drain_filter, bool_to_option)]
 
+mod code;
 mod compiler;
 mod eval;
 
 use std::{path::PathBuf, process};
 
-use eval::{env::Env, eval_function_call, eval_tree, Object};
+use eval::{env::Env, Object};
 use log::error;
 use parser::{parse_stdin, parse_str, NodePtr};
 use process::exit;

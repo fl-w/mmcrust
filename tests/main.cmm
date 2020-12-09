@@ -1,14 +1,12 @@
-int main() {
-    int x = 2;
-    int f() { x = 4; }
-
-    int z() {
-        int b() {
-            x = 2;
-        }
-
-        b();
-    }
-
-    z();
+int main(){
+    print_int(fact(3));
 }
+
+int fact(int n) {
+    if (n == 0) {
+        return 1;
+    } else {
+        return n * fact(n - 1);
+    }
+}
+
