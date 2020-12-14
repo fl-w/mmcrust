@@ -126,10 +126,15 @@ pub fn parse() -> Option<NodePtr> {
 
         let i = yyparse();
 
-        yydebug = 1;
-        // std::io::stdout().flush();
+        if log::log_enabled!(log::Level::Trace) {
+            yydebug = 1;
+        }
 
         if i == 0 {
+            if log::log_enabled!(log::Level::Debug) {
+                print_tree(ans);
+            }
+
             Some(ans)
         } else {
             None
@@ -137,14 +142,14 @@ pub fn parse() -> Option<NodePtr> {
     }
 }
 
-pub fn node_ptr_null(ptr: NodePtr) -> bool { unsafe { node_is_null(ptr) == 1 } }
+pub fn node_ptr_null(ptr: NodePtr) -> bool { unsafe { node_is_null(ptr) == 1 || ptr.is_null() } }
 
 #[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
-pub enum Infix {
+pub enum BinOp {
     Add,
-    Subtract,
-    Multiply,
-    Divide,
+    Sub,
+    Mul,
+    Div,
     Less,
     Greater,
     LessEqual,
@@ -153,18 +158,18 @@ pub enum Infix {
     NotEqual,
 }
 
-use Infix::*;
+use BinOp::*;
 
-impl fmt::Display for Infix {
+impl fmt::Display for BinOp {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
             "{}",
             match self {
                 Add => "+",
-                Subtract => "-",
-                Multiply => "*",
-                Divide => "/",
+                Sub => "-",
+                Mul => "*",
+                Div => "/",
                 Less => "<",
                 Greater => ">",
                 LessEqual => "<=",
@@ -197,12 +202,12 @@ pub enum YYTokenType {
     D,
     d,
     FunctionDef,
-    Declaration,
+    DECLARE,
     LinkedNodeBlock,
-    Assign,
+    ASSIGN,
     Comma,
     UnaryOp,
-    Infix(Infix),
+    Infix(BinOp),
 }
 
 impl TryFrom<i32> for YYTokenType {
@@ -229,13 +234,13 @@ impl TryFrom<i32> for YYTokenType {
             x if x == 'd' as i32 => Ok(YYTokenType::d),
             x if x == 'D' as i32 => Ok(YYTokenType::D),
             x if x == 'F' as i32 => Ok(YYTokenType::FunctionDef),
-            x if x == '=' as i32 => Ok(YYTokenType::Assign),
-            x if x == '~' as i32 => Ok(YYTokenType::Declaration),
+            x if x == '=' as i32 => Ok(YYTokenType::ASSIGN),
+            x if x == '~' as i32 => Ok(YYTokenType::DECLARE),
             x if x == ';' as i32 => Ok(YYTokenType::LinkedNodeBlock),
             x if x == '+' as i32 => Ok(YYTokenType::Infix(Add)),
-            x if x == '-' as i32 => Ok(YYTokenType::Infix(Subtract)),
-            x if x == '*' as i32 => Ok(YYTokenType::Infix(Multiply)),
-            x if x == '/' as i32 => Ok(YYTokenType::Infix(Divide)),
+            x if x == '-' as i32 => Ok(YYTokenType::Infix(Sub)),
+            x if x == '*' as i32 => Ok(YYTokenType::Infix(Mul)),
+            x if x == '/' as i32 => Ok(YYTokenType::Infix(Div)),
             x if x == '>' as i32 => Ok(YYTokenType::Infix(Greater)),
             x if x == '<' as i32 => Ok(YYTokenType::Infix(Less)),
             x if x == LE_OP as i32 => Ok(YYTokenType::Infix(LessEqual)),
@@ -262,13 +267,16 @@ impl TryFrom<NodePtr> for YYTokenType {
 }
 
 pub unsafe fn cstr_to_string(ptr: *const c_char) -> String {
-    CStr::from_ptr(ptr).to_string_lossy().to_owned().to_string()
+    let string = CStr::from_ptr(ptr).to_string_lossy().to_string();
+
+    unescape::unescape(string.as_str()).unwrap()
 }
 
+/// Given a function definition node, return the function name and list of parameter names.
 pub fn parse_fn(node: Node) -> (String, Vec<String>) {
     let parse_parameter = |pnode: Node| match pnode.token_type() {
         Some(YYTokenType::LEAF) => pnode.as_string().unwrap(),
-        Some(YYTokenType::Declaration) => pnode.right_node().unwrap().as_string().unwrap(),
+        Some(YYTokenType::DECLARE) => pnode.right_node().unwrap().as_string().unwrap(),
         _ => unreachable!(),
     };
 
@@ -302,16 +310,23 @@ pub fn parse_args(param: NodePtr) -> Vec<NodePtr> {
     let mut arg_list = vec![];
     let mut param = param;
 
-    while !node_ptr_null(param) {
+    log::debug!("(parser) start args parse at {:?}", param);
+
+    while !(param.is_null()) {
+        log::trace!("(parser) parse arg at {:?}", param);
+
         let node = unsafe { param.as_mut().unwrap() };
 
-        if let YYTokenType::Comma = node.type_.try_into().unwrap() {
-            arg_list.push(node.left);
-            param = node.right;
+        if let Some(YYTokenType::Comma) = node.token_type() {
+            arg_list.insert(0, node.right);
+            param = node.left;
         } else {
-            arg_list.push(param);
+            arg_list.insert(0, param);
+            break;
         };
     }
+
+    log::debug!("(parser) finish parse args {:?}", arg_list);
 
     arg_list
 }

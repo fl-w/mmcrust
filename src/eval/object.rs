@@ -1,11 +1,8 @@
-use std::{convert::TryInto, ffi::CStr, fmt, os::raw::c_int};
+use std::{fmt, os::raw::c_int};
 
-use itertools::Itertools;
-use log::{debug, trace};
-use parser::{self, cstr_to_string, Infix, Node, NodePtr, YYTokenType};
+use crate::code::CompiledFunction;
 
-use self::env::Env;
-use self::{builtins::Builtin, env::EnvScope};
+use super::{builtins::Builtin, env::EnvScope};
 
 #[derive(PartialEq, Clone)]
 pub enum Object {
@@ -19,10 +16,8 @@ pub enum Object {
     Void,
 }
 
-pub type TypeName = String;
-
 impl Object {
-    pub fn type_name(&self) -> TypeName {
+    pub fn type_name(&self) -> String {
         match self {
             Self::Int(_) => "int",
             Self::Str(_) => "str",
@@ -74,11 +69,3 @@ impl fmt::Display for Object {
         }
     }
 }
-
-// impl From<YYTokenType> for Object {
-//     fn from(token_type: YYTokenType) -> Self {
-//         match token_type {
-//             _ => Object::Int(0),
-//         }
-//     }
-// }

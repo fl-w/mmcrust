@@ -11,7 +11,7 @@ fn main() {
     Command::new("sh")
         .arg("-c")
         .arg(format!(
-            "flex -o {}/lex.yy.c src/C.flex && bison -d -t -v src/C.y -b {}/C",
+            "flex -o {}/lex.yy.c src/C.flex && bison -d -t -v src/C.y -b {}/C >/dev/null",
             out_dir, out_dir
         ))
         .output()

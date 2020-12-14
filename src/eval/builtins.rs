@@ -10,6 +10,8 @@ macro_rules! builtin {
 }
 
 pub static BUILTINS: &[Builtin] = &[
+    builtin!(println_str),
+    builtin!(println_int),
     builtin!(print_str),
     builtin!(print_int),
     builtin!(len),
@@ -37,21 +39,36 @@ pub fn len(args: Vec<Object>) -> EvalResult {
     }
 }
 
-pub fn main(_args: Vec<Object>) -> EvalResult { Ok(Object::Void) }
+pub fn main(_args: Vec<Object>) -> EvalResult {
+    log::debug!("(builtin) eval fn main");
+    Ok(Object::Void)
+}
 
-pub fn print_str(args: Vec<Object>) -> EvalResult { print(args, "print_str") }
+pub fn print_str(args: Vec<Object>) -> EvalResult { print(args, "print_str", false) }
 
-pub fn print_int(args: Vec<Object>) -> EvalResult { print(args, "print_int") }
+pub fn print_int(args: Vec<Object>) -> EvalResult { print(args, "print_int", false) }
 
-pub fn print(args: Vec<Object>, func_name: &str) -> EvalResult {
+pub fn println_str(args: Vec<Object>) -> EvalResult { print(args, "println_str", true) }
+
+pub fn println_int(args: Vec<Object>) -> EvalResult { print(args, "println_int", true) }
+
+pub fn print(args: Vec<Object>, func_name: &str, newline: bool) -> EvalResult {
+    log::debug!(
+        "(builtin) eval fn {}({})",
+        func_name,
+        args.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<String>>()
+            .join(",")
+    );
+
     match args.as_slice() {
-        [Object::Str(val)] => {
-            print!("{}", val);
-            Ok(Object::Void)
-        }
-
-        [Object::Int(val)] => {
-            print!("{}", val);
+        [obj] => {
+            if newline {
+                println!("{}", obj);
+            } else {
+                print!("{}", obj);
+            }
             Ok(Object::Void)
         }
 

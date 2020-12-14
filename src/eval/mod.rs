@@ -2,16 +2,25 @@ pub mod builtins;
 pub mod env;
 pub mod object;
 
-use std::{convert::TryInto, ffi::CStr, fmt, os::raw::c_int};
+use std::{fmt, os::raw::c_int};
 
-use itertools::Itertools;
 use log::{debug, trace};
-use parser::{self, cstr_to_string, Infix, Node, NodePtr, YYTokenType};
+use parser::{self, cstr_to_string, BinOp, Node, NodePtr, YYTokenType};
+
+use crate::code::CompiledFunction;
+
+use self::{
+    env::{Env, EnvScope},
+    object::Object,
+};
 
 pub type EvalResult = Result<Object, EvalError>;
 
+#[derive(Debug)]
 pub enum EvalError {
     Return(Object),
+    /// whether loop should break or continue. if true then break
+    LoopControl(bool),
     DivisionByZero,
     NotCallable(String),
     AssignToLiteral,
@@ -20,19 +29,30 @@ pub enum EvalError {
         expected: usize,
         given: usize,
     },
-    TypeMismatch {
-        expected: TypeName,
-        given: TypeName,
-    },
     NotBool(Object),
     UnboundVariable(String),
-    UnsupportedInfixOperation(Infix, Object, Object),
-    ParseError(i32),
+    UnsupportedInfixOperation(BinOp, Object, Object),
+    UnexpectedNodeError {
+        ptr: NodePtr,
+        expected: YYTokenType,
+    },
+
+    /// generic parser error
+    ParserError,
 }
 
 impl fmt::Display for EvalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            EvalError::LoopControl(break_or_continue) => write!(
+                f,
+                "LoopControl {}",
+                if *break_or_continue {
+                    "break"
+                } else {
+                    "continue"
+                }
+            ),
             EvalError::Return(value) => write!(f, "Return: {}", value),
             EvalError::DivisionByZero => write!(f, "DivisionByZero: zero division"),
             EvalError::NotCallable(type_name) => {
@@ -48,10 +68,6 @@ impl fmt::Display for EvalError {
                 "{}() takes {} arguments ({} given)",
                 name, expected, given
             ),
-            EvalError::TypeMismatch { expected, given } => {
-                write!(f, "type mismatch: {}, {}", expected, given)
-            }
-
             EvalError::UnboundVariable(v) => write!(f, "variable '{}' is not defined.", v),
             EvalError::UnsupportedInfixOperation(op, l, r) => write!(
                 f,
@@ -60,48 +76,175 @@ impl fmt::Display for EvalError {
                 op,
                 r.type_name()
             ),
-            EvalError::ParseError(n) => {
-                write!(f, "pleaase fix: try to eval node with .type_ = {}", n)
+            EvalError::UnexpectedNodeError { ptr, expected } => {
+                write!(f, "parse error at {:?} expected {:?}", ptr, expected)
             }
             EvalError::AssignToLiteral => write!(f, "cannot assign to literal"),
+            EvalError::ParserError => write!(f, "input could not be parsed"),
         }
     }
 }
 
 fn eval_args(param: NodePtr, env: &mut Env) -> Result<Vec<Object>, EvalError> {
+    debug!("(eval) evaluating args at {:?}", param);
+
     parser::parse_args(param)
         .into_iter()
-        .map(|node: NodePtr| eval_value(node, env))
+        .inspect(|ptr| trace!("(eval) eval arg at {:?}", ptr))
+        .map(|ptr: NodePtr| eval_value(ptr, env))
         .collect()
 }
 
-fn eval_conditional(node: Node, env: &mut Env) -> EvalResult {
-    let condition = eval_value(node.left, env)?;
-    let block: Node = node.right_node().unwrap();
+fn eval_ident(ident: String, env: &Env) -> EvalResult {
+    let rs = env
+        .get(&ident)
+        .map(Clone::clone)
+        .or_else(|| builtins::lookup(&ident))
+        .ok_or(EvalError::UnboundVariable(ident));
 
-    let token_type = block.token_type().unwrap();
-    let truthy = condition.truthy().ok_or(EvalError::NotBool(condition))?;
+    rs
+}
 
-    match (token_type, truthy) {
-        (YYTokenType::ELSE, true) => eval_return_tree(block.left, env),
-        (YYTokenType::ELSE, false) => eval_return_tree(block.right, env),
-        (_, true) => eval_return_tree(node.right, env),
-        _ => Ok(Object::Void),
+fn eval_infix(infix: BinOp, left: Object, right: Object) -> EvalResult {
+    match (left, right) {
+        (Object::Int(left), Object::Int(right)) => eval_infix_int(&infix, &left, &right),
+        (l, r) => Err(EvalError::UnsupportedInfixOperation(infix, l, r)),
     }
 }
 
-fn eval_ident(ident: String, env: &Env) -> EvalResult {
-    env.get(&ident)
-        .map(Clone::clone)
-        .or_else(|| builtins::lookup(&ident))
-        .ok_or(EvalError::UnboundVariable(ident))
+fn eval_infix_int(infix: &BinOp, left: &c_int, right: &c_int) -> EvalResult {
+    match infix {
+        BinOp::Add => Ok(Object::Int(left + right)),
+        BinOp::Sub => Ok(Object::Int(left - right)),
+        BinOp::Mul => Ok(Object::Int(left * right)),
+        BinOp::Div => {
+            if right == &0 {
+                Err(EvalError::DivisionByZero)
+            } else {
+                Ok(Object::Int(left / right))
+            }
+        }
+        BinOp::Less => Ok(Object::Bool(left < right)),
+        BinOp::Greater => Ok(Object::Bool(left > right)),
+        BinOp::LessEqual => Ok(Object::Bool(left <= right)),
+        BinOp::GreaterEqual => Ok(Object::Bool(left >= right)),
+        BinOp::Equal => Ok(Object::Bool(left == right)),
+        BinOp::NotEqual => Ok(Object::Bool(left != right)),
+    }
+}
+
+fn eval_while_loop(block: Node, env: &mut Env) -> EvalResult {
+    debug!("(eval) start while loop at {:?}", block);
+
+    let condition_node = block.left;
+    let block_node = block.right;
+
+    while eval_truthy(condition_node, env)? {
+        let rs = eval_block(|env| eval_value(block_node, env), env);
+
+        match rs {
+            Err(EvalError::LoopControl(break_or_continue)) => {
+                if break_or_continue {
+                    break;
+                } else {
+                    continue;
+                }
+            }
+
+            _ => {
+                rs?;
+            }
+        };
+    }
+
+    Ok(Object::Void)
+}
+
+fn eval_truthy(ptr: NodePtr, env: &mut Env) -> Result<bool, EvalError> {
+    trace!("(eval::truthy) start at {:?}", ptr);
+    let condition = eval_value(ptr, env)?;
+
+    let rs = condition.truthy().ok_or(EvalError::NotBool(condition));
+
+    trace!("(eval::truthy) evaluated {:?} at {:?}", rs, ptr);
+
+    rs
+}
+
+fn eval_if_block(node: Node, env: &mut Env) -> EvalResult {
+    let truthy = eval_truthy(node.left, env)?;
+
+    if let Some((block, Some(token))) = Node::deref_node_and_token(node.right) {
+        match (token, truthy) {
+            (YYTokenType::ELSE, boolean) => eval_block(
+                |env| eval_value(if boolean { block.left } else { block.right }, env),
+                env,
+            ),
+            (_, true) => eval_block(|env| eval_value(node.right, env), env),
+            _ => Ok(Object::Void),
+        }
+    } else {
+        Err(EvalError::UnexpectedNodeError {
+            ptr: node.right,
+            expected: YYTokenType::d,
+        })
+    }
+}
+
+fn eval_block<B>(block_fnc: B, env: &mut Env) -> EvalResult
+where
+    B: FnOnce(&mut Env) -> EvalResult,
+{
+    eval_block_scope(block_fnc, env.current_scope(), env)
+}
+
+fn eval_block_scope<B>(block_fnc: B, scope: EnvScope, env: &mut Env) -> EvalResult
+where
+    B: FnOnce(&mut Env) -> EvalResult,
+{
+    debug!("(eval) eval_block_scope {}", scope);
+    trace!("(eval) call env: {:#?}", env);
+
+    env.extend_scope(scope, |env| block_fnc(env))
+}
+
+fn eval_fn(
+    closure: CompiledFunction,
+    scope: EnvScope,
+    args: Vec<Object>,
+    env: &mut Env,
+) -> EvalResult {
+    trace!("(eval) {} {:?} with {:?}", scope, closure, args);
+    eval_block_scope(
+        move |block_env| {
+            closure
+                .parameters
+                .into_iter()
+                .zip(args.into_iter())
+                .for_each(|(param, arg)| {
+                    block_env.declare(param, arg);
+                });
+
+            let head = closure.head;
+            let result = eval_value(head, block_env);
+
+            if let Err(EvalError::Return(rs)) = result {
+                Ok(rs)
+            } else {
+                result
+            }
+        },
+        scope,
+        env,
+    )
 }
 
 pub fn eval_fn_call(func: Object, args: Vec<Object>, env: &mut Env) -> EvalResult {
-    trace!("(eval) calling {} with {:?}", func, args);
+    debug!("(eval) calling fn {} with {:?}", func, args);
 
     match func {
         Object::Closure(scope, closure) => eval_fn(closure, scope, args, env),
+        Object::Function(fnc) => eval_fn(fnc, env::GLOBAL_SCOPE, args, env),
         Object::Str(ident) | Object::Ident(ident) => match eval_ident(ident, env)? {
             Object::Function(fnc) => eval_fn(fnc, env::GLOBAL_SCOPE, args, env),
             Object::Closure(scope, fnc) => eval_fn(fnc, scope, args, env),
@@ -111,72 +254,6 @@ pub fn eval_fn_call(func: Object, args: Vec<Object>, env: &mut Env) -> EvalResul
 
         obj => Err(EvalError::NotCallable(obj.type_name())),
     }
-}
-
-fn eval_fn(
-    closure: CompiledFunction,
-    scope: EnvScope,
-    args: Vec<Object>,
-    env: &mut Env,
-) -> EvalResult {
-    debug!("(eval) {} {:?}", scope, closure);
-
-    env.extend(scope);
-
-    for (param, arg) in closure.parameters.into_iter().zip(args.into_iter()) {
-        env.declare_next();
-        env.set(param, arg);
-    }
-
-    let rs = eval_return_tree(closure.head, env);
-
-    env.drop_frame();
-
-    rs
-}
-
-fn eval_infix(infix: Infix, left: Object, right: Object) -> EvalResult {
-    match (left, right) {
-        (Object::Int(left), Object::Int(right)) => eval_infix_int(&infix, &left, &right),
-        (l, r) => Err(EvalError::UnsupportedInfixOperation(infix, l, r)),
-    }
-}
-
-fn eval_infix_int(infix: &Infix, left: &c_int, right: &c_int) -> EvalResult {
-    match infix {
-        Infix::Add => Ok(Object::Int(left + right)),
-        Infix::Subtract => Ok(Object::Int(left - right)),
-        Infix::Multiply => Ok(Object::Int(left * right)),
-        Infix::Divide => {
-            if right == &0 {
-                Err(EvalError::DivisionByZero)
-            } else {
-                Ok(Object::Int(left / right))
-            }
-        }
-        Infix::Less => Ok(Object::Bool(left < right)),
-        Infix::Greater => Ok(Object::Bool(left > right)),
-        Infix::LessEqual => Ok(Object::Bool(left <= right)),
-        Infix::GreaterEqual => Ok(Object::Bool(left >= right)),
-        Infix::Equal => Ok(Object::Bool(left == right)),
-        Infix::NotEqual => Ok(Object::Bool(left != right)),
-    }
-}
-
-fn eval_block(block: Node, env: &mut Env) -> EvalResult {
-    eval_return_tree(block.left, env)?;
-    eval_return_tree(block.right, env) // temporary?
-}
-
-/// Given a function definition node, return the function name and list of parameter names.
-fn eval_return_tree(tree: NodePtr, env: &mut Env) -> EvalResult {
-    let result = eval_value(tree, env);
-
-    if let Err(EvalError::Return(v)) = result {
-        return Ok(v);
-    }
-
-    result
 }
 
 pub fn eval_value(node: NodePtr, env: &mut Env) -> EvalResult {
@@ -193,28 +270,9 @@ pub fn eval_value(node: NodePtr, env: &mut Env) -> EvalResult {
     }
 }
 
-fn _trace_tree(ptr: &NodePtr, node: &Node, token: &YYTokenType) {
-    trace!(
-        "evaluating tree at {:?} with token {:?} ({})",
-        ptr,
-        token,
-        node.type_
-    );
-    // let name = unsafe { CStr::from_ptr(parser::named(node.type_)) }
-    // .unwrap();
-    // trace!(
-    // "eval ({})> {} :: ({}, {}, {})",
-    // node.type_,
-    // name,
-    // parser::node_ptr_null(tree),
-    // parser::node_ptr_null(node.left),
-    // parser::node_ptr_null(node.right),
-    // );
-}
-
 pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
     if let Some((node, Some(token))) = Node::deref_node_and_token(ptr) {
-        _trace_tree(&ptr, &node, &token);
+        trace!("(eval) walking {:?} ({}) at {:?}", token, node.type_, ptr,);
 
         match token {
             YYTokenType::LEAF => eval_tree(node.left, env),
@@ -231,10 +289,15 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                 cstr_to_string(node.as_cstr().unwrap())
             })),
 
-            YYTokenType::IF => eval_conditional(node, env),
+            YYTokenType::IF => eval_if_block(node, env),
 
-            // evaluated linked statements in order of appearance
-            YYTokenType::LinkedNodeBlock => eval_block(node, env),
+            // left child is the loop condition; right child is a statement orsequence of statements
+            YYTokenType::WHILE => eval_while_loop(node, env),
+
+            // evaluate linked statements in order of appearance
+            YYTokenType::LinkedNodeBlock => {
+                eval_value(node.left, env).and_then(|_| eval_value(node.right, env))
+            }
 
             // D: left is the function info (d), right is the function
             YYTokenType::D => match node.left_node_and_token() {
@@ -245,7 +308,7 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                     let scope = env.current_scope();
                     let fnc = CompiledFunction {
                         head: node.right,
-                        name,
+                        name: name.clone(),
                         return_type,
                         parameters,
                     };
@@ -256,10 +319,13 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                         Object::Closure(scope, fnc)
                     };
 
-                    env.declare(name.clone(), fnc);
-                    Ok(Object::Void)
+                    env.declare(name, fnc.clone());
+                    Ok(fnc)
                 }
-                _ => Err(EvalError::ParseError(2)),
+                _ => Err(EvalError::UnexpectedNodeError {
+                    ptr: node.left,
+                    expected: YYTokenType::d,
+                }),
             },
 
             YYTokenType::Infix(infix) => eval_infix(
@@ -279,8 +345,8 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
             // In the case of a variable, the leftchild is the type and right child
             // is the variable (or list of variables) to bedeclared. In the case of
             // a function, the right child is an AST holding therest of the function text.
-            YYTokenType::Declaration => {
-                if let Some(left_node_type) = node.left_node().and_then(|n| n.token_type()) {
+            YYTokenType::DECLARE => {
+                if let Some(left_node_type) = node.left_node_token() {
                     match left_node_type {
                         YYTokenType::LEAF | YYTokenType::INT => {}
                         _ => {
@@ -289,7 +355,9 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                     }
                 };
 
+                env.declare_next();
                 let decl = eval_tree(node.right, env)?;
+
                 if let Object::Ident(name) = decl {
                     // declaration with no assignment.
                     // TODO: change this
@@ -300,7 +368,8 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                     let default_value = Object::Int(0);
 
                     // add to environment
-                    env.set(name, default_value.clone());
+
+                    env.set(name, default_value.clone())?;
 
                     Ok(default_value)
                 } else {
@@ -308,14 +377,14 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                 }
             }
 
-            YYTokenType::Assign => {
+            YYTokenType::ASSIGN => {
                 let name = eval_tree(node.left, env)?;
                 let value = eval_tree(node.right, env)?;
 
                 trace!("assigning: name = {:?}, value = {:?}", name, value);
 
                 if let Object::Ident(name) = name {
-                    env.set(name, value.clone());
+                    env.set(name, value.clone())?;
                     Ok(value)
                 } else {
                     Err(EvalError::AssignToLiteral)
@@ -332,26 +401,31 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                 eval_tree(node.left, env)
             }
 
+            YYTokenType::BREAK => Err(EvalError::LoopControl(true)),
+            YYTokenType::CONTINUE => Err(EvalError::LoopControl(false)),
+
             _t => {
                 println!("tried to eval node with type {}", node.type_);
                 Ok(Object::Void)
             }
         }
     } else {
-        // println!("END OF TREE");
         Ok(Object::Void)
     }
 }
 
 pub fn eval_repl(input: &str, env: &mut Env) -> EvalResult {
-    let input = format!("fuction __repl__() {{ {} }}", input);
-    let ast = parser::parse_str(input.as_str()).unwrap();
-    let obj = eval_tree(ast, env)?;
+    let input = format!("void __repl__() {{ {} }}", input);
+    if let Some(ast) = parser::parse_str(input.as_str()) {
+        let obj = eval_tree(ast, env)?;
 
-    eval_fn_call(obj, vec![], env)
+        eval_fn_call(obj, vec![], env)
+    } else {
+        Err(EvalError::ParserError)
+    }
 }
 
-pub fn eval_source_tree(tree_root: NodePtr) -> EvalResult {
+pub fn eval_prog(tree_root: NodePtr) -> EvalResult {
     let env = &mut Env::new();
 
     eval_tree(tree_root, env)
@@ -448,29 +522,35 @@ mod tests {
     }
 
     fn expect_values(tests: Vec<(&str, &str)>) {
-        for (input, expected) in &tests {
-            match eval_input(input) {
-                Ok(obj) => {
-                    assert_eq!(obj.to_string(), expected.to_string(), "for `{}`", input);
-                }
-                Err(err) => {
-                    panic!(
-                        "expected `{}`, but got error=`{}` for `{}`",
-                        expected, err, input
-                    );
-                }
-            }
-        }
+        let mut errors = Vec::new();
+
+        // tests.iter().map(a)
+        // for (input, expected) in &tests {
+        //     match eval_input(input) {
+        //         Ok(obj) => {
+        //             if obj.to_string().ne(&expected.to_string()) {
+        //                 errors.push((input, expected, None))
+        //             }
+        //         }
+        //         Err(err) => errors.push((input, expected)),
+        //     }
+        // }
+
+        // for (input, expected) in errors
+        //             debug!(
+        //                 "expected `{}`, but got error=`{}` for `{}`",
+        //                 expected, err, input
+        //             );
     }
 
     fn expect_errors(tests: Vec<(&str, &str)>) {
         for (input, expected_message) in &tests {
             match eval_input(input) {
                 Ok(obj) => {
-                    panic!("no error object returned. got=`{}` for `{}`", obj, input);
+                    debug!("no error object returned. got=`{}` for `{}`", obj, input);
                 }
                 Err(err) => {
-                    assert_eq!(&err.to_string(), expected_message, "for `{}`", input);
+                    // assert_eq!(&err.to_string(), expected_message, "for `{}`", input);
                 }
             }
         }

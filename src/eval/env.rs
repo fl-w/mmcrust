@@ -38,14 +38,43 @@ impl Env {
         }
     }
 
-    pub fn extend(&mut self, extend_scope: EnvScope) {
+    fn add_frame(&mut self, from_scope: EnvScope) {
         self.frames.push(Frame {
-            extends: extend_scope,
+            extends: from_scope,
             bindings: HashMap::new(),
         });
     }
 
-    pub fn current_scope(&self) -> EnvScope { self.frames.len() }
+    // pub fn extend<F, T>(&mut self, closure: F) -> T
+    // where
+    //     F: FnOnce(&mut Env) -> T,
+    // {
+    //     let scope = self.current_scope();
+
+    //     self.extend_scope(scope, closure)
+    // }
+
+    pub fn extend_scope<F, T>(&mut self, scope: EnvScope, closure: F) -> T
+    where
+        F: FnOnce(&mut Env) -> T,
+    {
+        self.add_frame(scope);
+
+        let rs = closure(self);
+
+        if !self.frames[self.current_scope()]
+            .bindings
+            .values()
+            .any(|obj| matches!(*obj, Object::Closure(_, _)))
+        {
+            // drop frame if no closures were defined in the current frame
+            self.drop_frame();
+        }
+
+        rs
+    }
+
+    pub fn current_scope(&self) -> EnvScope { self.frames.len() - 1 }
 
     pub fn declare_next(&mut self) { self.declare_next = true; }
 
@@ -71,7 +100,7 @@ impl Env {
     pub fn get(&self, key: &str) -> Option<&Object> { self.get_in_scope(key, self.current_scope()) }
 
     pub fn get_in_scope(&self, key: &str, scope: EnvScope) -> Option<&Object> {
-        self.find_from_scope(key, scope)
+        self.find_scope(key, scope)
             .map(|scope| self.frames[scope].bindings.get(key).unwrap())
     }
 
@@ -80,21 +109,23 @@ impl Env {
     }
 
     pub fn get_mut_in_scope(&mut self, key: &str, scope: EnvScope) -> Option<&mut Object> {
-        if let Some(scope) = self.find_from_scope(key, scope) {
+        if let Some(scope) = self.find_scope(key, scope) {
             self.frames[scope].bindings.get_mut(key)
         } else {
             None
         }
     }
 
-    fn find_from_scope(&self, key: &str, scope: EnvScope) -> Option<EnvScope> {
-        self.frames.get(scope).and_then(|frame: &Frame| {
-            if frame.bindings.contains_key(key) {
-                Some(scope)
-            } else {
-                None
-            }
-        })
+    fn find_scope(&self, key: &str, scope: EnvScope) -> Option<EnvScope> {
+        let frame = &self.frames[scope];
+
+        if frame.bindings.contains_key(key) {
+            Some(scope)
+        } else if frame.extends == scope {
+            None // circular dependency found
+        } else {
+            self.find_scope(key, frame.extends)
+        }
     }
 }
 
