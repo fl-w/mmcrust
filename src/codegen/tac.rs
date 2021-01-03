@@ -5,7 +5,7 @@ use std::{
     os::raw::c_int,
 };
 
-use parser::{BinOp, Node, NodePtr, YYTokenType};
+use parser::{BinOp, FnDef, Node, NodePtr, YYTokenType};
 use Address::{Const, Name};
 use Constant::*;
 
@@ -15,14 +15,14 @@ pub type TacSequence = Vec<Tac>;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum Constant {
-    Int(c_int),
+    Int32(c_int),
     Str(String),
 }
 
 impl fmt::Display for Constant {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match self {
-            Self::Int(i) => write!(f, "{}", i),
+            Self::Int32(i) => write!(f, "{}", i),
             Self::Str(i) => write!(f, "{}", i),
         }
     }
@@ -129,8 +129,6 @@ impl Cond {
 pub enum TacKind {
     Store(Address),
 
-    UnaryOp(BinOp, Address),
-
     BinOp(BinOp, Address, Address),
 
     BranchTarget,
@@ -144,6 +142,10 @@ pub enum TacKind {
     ProcEnd,
 
     Call(Vec<Address>),
+
+    Return(Option<Address>),
+
+    UnaryOp(BinOp, Address),
 
     Nop, // Closure(Address),
 }
@@ -175,7 +177,6 @@ impl fmt::Display for Tac {
             TacKind::UnaryOp(op, src) => {
                 write!(f, "{} = {} {}", dst, op, src)
             }
-
             TacKind::CBranch(cond, left, right) => {
                 write!(f, "if {}{}{} goto {} ", left, cond, right, dst)
             }
@@ -184,7 +185,24 @@ impl fmt::Display for Tac {
 
             TacKind::ProcEnd => write!(f, "end({})", dst),
 
-            TacKind::Call(args) => write!(f, "{}()", dst),
+            TacKind::Return(ref value) => write!(
+                f,
+                "return {}",
+                value
+                    .clone()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(String::new)
+            ),
+
+            TacKind::Call(args) => write!(
+                f,
+                "{}",
+                args.iter()
+                    .map(|param| format!("param {}", param))
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            )
+            .and(write!(f, "call {} {}", dst, args.len())),
 
             Nop => Ok(()),
         }
@@ -259,9 +277,8 @@ struct TacTranspiler {
     stack: TacSequence,
     temp_counter: usize,
     current_loop: Option<(Address, Address)>,
-    current_function: Option<CompiledFunction>,
-    symbol_table: SymbolTable,
-    prog: Program,
+    current_function: Option<FnDef>,
+    globals: Vec<String>,
 }
 
 impl TacTranspiler {
@@ -421,7 +438,7 @@ impl TacTranspiler {
         }
     }
 
-    pub fn add_call(&mut self, node: Node) {
+    pub fn add_call(&mut self, node: Node) -> Address {
         let name = self.walk(node.left_node().unwrap());
         let args: Vec<Address> = parser::parse_args(node.right)
             .into_iter()
@@ -438,10 +455,30 @@ impl TacTranspiler {
                 .collect::<Vec<String>>()
                 .join(", ")
         );
+
+        self.add_instruction(name, TacKind::Call(args)).clone()
+    }
+
+    fn add_return(&mut self, node: Node) -> Address {
+        let value = if let Some(left_node) = node.left_node() {
+            Some(self.walk(left_node))
+        } else {
+            None
+        };
+
+        self.add_instruction(Const(Int32(0)), TacKind::Return(value))
+            .clone()
     }
 
     fn add_decl(&mut self, node: Node) -> Address {
         let addr = self.walk(node.left_node().unwrap());
+
+        // let is_global = self.current_function.is_none();
+        // if is_global {
+        //     if let Name(ref value) = addr {
+        //         self.globals.push(value.clone());
+        //     }
+        // }
 
         if let Some(node) = node.right_node() {
             self.walk(node)
@@ -498,7 +535,7 @@ impl TacTranspiler {
 
             match token {
                 YYTokenType::INT => Name("int".to_owned()),
-                YYTokenType::CONSTANT => Const(Int(node.as_cint().unwrap())),
+                YYTokenType::CONSTANT => Const(Int32(node.as_cint().unwrap())),
                 YYTokenType::STRING_LITERAL => Const(Str(node.as_string().unwrap())),
                 YYTokenType::IDENTIFIER => Name(node.as_string().unwrap()),
                 YYTokenType::BREAK => self.add_loop_jump("break"),
@@ -508,10 +545,10 @@ impl TacTranspiler {
                 YYTokenType::WHILE => self.add_while_block(node),
                 YYTokenType::ASSIGN => self.add_assignment(node),
                 YYTokenType::DECLARE => self.add_decl(node),
+                YYTokenType::RETURN => self.add_return(node),
                 YYTokenType::Infix(op) => self.add_expr(node, op),
                 YYTokenType::D => self.add_fn(node),
-
-                // YYTokenType::APPLY => self.add_call(node),
+                YYTokenType::APPLY => self.add_call(node),
                 _ => {
                     let addr = self.walk(node.left_node().unwrap());
 

@@ -330,3 +330,38 @@ pub fn parse_args(param: NodePtr) -> Vec<NodePtr> {
 
     arg_list
 }
+
+#[derive(PartialEq, Clone, Default)]
+pub struct FnDef {
+    pub name: String,
+    pub parameters: Vec<String>,
+    pub return_type: String,
+}
+
+#[derive(PartialEq, Clone)]
+pub struct Func {
+    pub head: NodePtr,
+    pub def: FnDef,
+}
+
+impl std::fmt::Debug for Func {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "<{} {}({}) at {:?}>",
+            self.def.return_type,
+            self.def.name,
+            self.def.parameters.join(","),
+            self.head
+        )
+    }
+}
+
+impl Default for Func {
+    fn default() -> Self {
+        Self {
+            def: FnDef::default(),
+            head: std::ptr::null_mut() as NodePtr,
+        }
+    }
+}

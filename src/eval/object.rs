@@ -1,6 +1,5 @@
+use parser::Func;
 use std::{fmt, os::raw::c_int};
-
-use crate::code::CompiledFunction;
 
 use super::{builtins::Builtin, env::EnvScope};
 
@@ -10,8 +9,8 @@ pub enum Object {
     Bool(bool),
     Str(String),
     Ident(String),
-    Function(CompiledFunction),
-    Closure(EnvScope, CompiledFunction),
+    Function(Func),
+    Closure(EnvScope, Func),
     BuiltinFunction(Builtin),
     Void,
 }
@@ -48,7 +47,13 @@ impl fmt::Debug for Object {
             Object::BuiltinFunction((name, _)) => write!(f, "<{}>", name),
             Object::Ident(value) => write!(f, "<ident {}>", value),
             Object::Function(fnc) => {
-                write!(f, "<{} {} at {:?}>", self.type_name(), fnc.name, fnc.head)
+                write!(
+                    f,
+                    "<{} {} at {:?}>",
+                    self.type_name(),
+                    fnc.def.name,
+                    fnc.head
+                )
             }
             Object::Closure(scope, fnc) => {
                 write!(f, "<{} at {:?}::{}>", self.type_name(), fnc.head, scope)

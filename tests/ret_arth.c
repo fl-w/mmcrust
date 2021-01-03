@@ -1,1 +1,2 @@
-int main() { return 2 + 2; }
+int main() { return y + x + 2; }
+

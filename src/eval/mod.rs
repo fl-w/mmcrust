@@ -5,9 +5,7 @@ pub mod object;
 use std::{fmt, os::raw::c_int};
 
 use log::{debug, trace};
-use parser::{self, cstr_to_string, BinOp, Node, NodePtr, YYTokenType};
-
-use crate::code::CompiledFunction;
+use parser::{self, cstr_to_string, BinOp, FnDef, Func, Node, NodePtr, YYTokenType};
 
 use self::{
     env::{Env, EnvScope},
@@ -208,16 +206,12 @@ where
     env.extend_scope(scope, |env| block_fnc(env))
 }
 
-fn eval_fn(
-    closure: CompiledFunction,
-    scope: EnvScope,
-    args: Vec<Object>,
-    env: &mut Env,
-) -> EvalResult {
+fn eval_fn(closure: Func, scope: EnvScope, args: Vec<Object>, env: &mut Env) -> EvalResult {
     trace!("(eval) {} {:?} with {:?}", scope, closure, args);
     eval_block_scope(
         move |block_env| {
             closure
+                .def
                 .parameters
                 .into_iter()
                 .zip(args.into_iter())
@@ -306,11 +300,13 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                     let (name, parameters) = parser::parse_fn(def.right_node().unwrap());
 
                     let scope = env.current_scope();
-                    let fnc = CompiledFunction {
+                    let fnc = Func {
                         head: node.right,
-                        name: name.clone(),
-                        return_type,
-                        parameters,
+                        def: FnDef {
+                            name: name.clone(),
+                            return_type,
+                            parameters,
+                        },
                     };
 
                     let fnc = if scope == env::GLOBAL_SCOPE {
@@ -425,10 +421,10 @@ pub fn eval_repl(input: &str, env: &mut Env) -> EvalResult {
     }
 }
 
-pub fn eval_prog(tree_root: NodePtr) -> EvalResult {
+pub fn eval_prog(ast_root: NodePtr) -> EvalResult {
     let env = &mut Env::new();
 
-    eval_tree(tree_root, env)
+    eval_tree(ast_root, env)
         .and_then(|_| eval_fn_call(Object::Ident("main".to_owned()), vec![], env))
 }
 
@@ -522,7 +518,7 @@ mod tests {
     }
 
     fn expect_values(tests: Vec<(&str, &str)>) {
-        let mut errors = Vec::new();
+        // let mut errors = Vec::new();
 
         // tests.iter().map(a)
         // for (input, expected) in &tests {

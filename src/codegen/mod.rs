@@ -1,14 +1,16 @@
 // pub mod optimiser;
-pub mod tac;
+mod symbol_table;
+mod tac;
 
 use log::{debug, trace};
 use parser::*;
-use std::{collections::HashMap, path::PathBuf};
-use Constant::Int;
+use std::collections::HashMap;
+use Constant::Int32;
 
 use self::tac::{Address, Cond, Constant, Tac, TacKind, TacSequence};
+use symbol_table::*;
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct Assembly {
     asm: String,
 }
@@ -28,139 +30,172 @@ impl Assembly {
     fn addl<S: Into<String>>(&mut self, string: S) {
         self.asm.push_str(format!("{}\n", string.into()).as_str())
     }
+    fn addli<S: Into<String>>(&mut self, string: S) {
+        self.addi(string);
+        self.addl("")
+    }
 
     fn add_all<S: Into<String>>(&mut self, strings: Vec<S>) {
         for string in strings {
             self.asm.push_str(string.into().as_str())
         }
     }
+
+    fn addi_all<S: Into<String>>(&mut self, strings: Vec<S>) {
+        for string in strings {
+            self.addi(string);
+            self.addl("")
+        }
+    }
 }
 
 #[derive(Debug, Default)]
-pub struct Generator {
+pub struct MipsGenerator {
     conditional_count: i32,
     symbol_table: HashMap<char, String>,
+    asm: Assembly,
 }
 
-struct Frame {
-    formals: usize,
-    offlst: Vec<usize>,
-    locals: usize,
-    maxargs: Box<usize>,
-}
+impl MipsGenerator {
+    fn emit<S: Into<String>>(&mut self, string: S) { self.asm.addli(string) }
 
-struct Level {
-    frame: Frame,
-    slink_offset: usize,
-    parent: Box<Level>,
-}
+    fn emit_label<S: Into<String>>(&mut self, string: S) { self.asm.addl(string) }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct ActivationRecord {
-    fp: Box<ActivationRecord>,
-    param: Vec<Address>,
-    pc: usize,
-}
+    fn emit_comment<S: Into<String>>(&mut self, string: S) {
+        self.asm.add("# ");
+        self.asm.addl(string)
+    }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub enum SymbolScope {
-    Global,
-    Local,
-}
+    fn gen_printf(&mut self) {
+        // Generate printf
+        self.asm.addl("_printf:");
+        self.asm.addi_all(vec![
+            "swc1 $f12, 0($sp)",
+            "mtc1 $a0, $f12",
+            "li $v0, 2",
+            "syscall",
+            "lwc1 $f12, 0($sp)",
+            "jal $ra",
+            "",
+        ]);
+    }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
-pub struct Symbol {
-    pub scope: SymbolScope,
-    pub index: u16,
-}
-struct SymbolLayer {
-    store: HashMap<SymbolName, Symbol>,
-    num_of_vars: usize,
-}
+    /// Generate print_int
+    fn gen_print_int(&mut self) {
+        self.asm.addl("_print_int:");
+        self.asm.addi_all(vec!["li $v0, 1", "syscall", "jal $ra"]);
+    }
 
-#[derive(Default)]
-struct SymbolTable {
-    store: HashMap<CompiledFunction, SymbolLayer>,
-}
+    /// Generate new line
+    fn gen_nl(&mut self) { self.emit_label("_newline:   .asciiz \"\\n\""); }
 
-impl Generator {
-    pub fn generate(&mut self, prog: TacSequence) -> String {
-        let mut asm = Assembly::default();
-        let mut function = None; // store the current function
-        let mut sp = 0;
-        let mut symbol_table = SymbolTable::default();
+    fn gen_fnc(&mut self, code: Tac) {
+        let func_name = code.target.to_string();
+
+        self.emit_label(format!(".ent {}", func_name));
+        self.emit_label(format!("{}:", func_name));
+        self.emit(".frame $sp,4,$31");
+
+        // TacKind::BranchTarget => self.assembly.addi(format!("{}:", code.target)),
+        self.emit_label(format!(".end {}", func_name));
+    }
+
+    pub fn generate(&mut self, prog: TacSequence) {
+        self.emit_label(".data");
+        self.gen_nl();
+
+        self.emit_label("\n\n.text");
+        self.gen_printf();
 
         for code in prog {
-            asm.add("# ");
-            asm.addl(code.to_string());
-
             match &code.kind {
-                TacKind::BranchTarget => asm.addi(format!("{}:", code.target)),
-
-                TacKind::Store(Address::Const(Int(k))) => {
-                    asm.addi(format!("li ${}, {}", code.target, k))
+                TacKind::ProcBegin(_) => {
+                    self.emit(format!(".globl {}", code.target));
+                    // let fn_block = Vec::new();
+                    self.gen_fnc(code);
                 }
 
-                TacKind::Store(ref from) => asm.addi(format!(
-                    "add{} {}, $R0, {}",
-                    if matches!(from, Address::Const(_)) {
-                        "i"
-                    } else {
-                        ""
-                    },
-                    code.target,
-                    from
-                )),
+                // TacKind::Store(Address::Const(Int32(k))) => {
+                //     assembly.addi(format!("li ${}, {}", code.target, k))
+                // }
 
-                TacKind::Call(args) => {
-                    // move stack pointer to accomadate args
-                    asm.addi(format!("subi $sp, $sp {}", 4 * args.len()));
+                // TacKind::Store(ref from) => assembly.addi(format!(
+                //     "add{} {}, $R0, {}",
+                //     if matches!(from, Address::Const(_)) {
+                //         "i"
+                //     } else {
+                //         ""
+                //     },
+                //     code.target,
+                //     from
+                // )),
 
-                    let mut sp_disp = 4;
-                    for arg in args {
-                        asm.addi(format!("li $t0, {}", arg))
-                    }
-                }
+                // TacKind::Call(args) => {
+                //     // move stack pointer to accomadate args
+                //     assembly.addi(format!("subi $sp, $sp {}", 4 * args.len()));
 
-                TacKind::BinOp(operator, Address::Name(a), Address::Name(b)) => {
-                    asm.addi(format!("lw $t0", a));
-                    asm.addi(format!("lw $t1", b));
-                    asm.addi(format!("add {} {}", a, b));
-                }
+                //     let mut sp_disp = 4;
+                //     for arg in args {
+                //         assembly.addi(format!("li $t0, {}", arg))
+                //     }
+                // }
 
-                TacKind::BinOp(BinOp::Add, left, Address::Const(k)) => {
-                    asm.addi(format!("addi {}, {}, {}", code.target, left, k))
-                }
+                // TacKind::BinOp(operator, Address::Name(a), Address::Name(b)) => {
+                //     assembly.addi(format!("lw {}", a));
+                //     assembly.addi(format!("lw {}", b));
+                //     assembly.addi(format!("add {} {}", a, b));
+                // }
 
-                TacKind::BinOp(BinOp::Add, left, right) => {
-                    asm.addi(format!("add {}, {}, {}", code.target, left, right))
-                }
+                // // add immediate
+                // TacKind::BinOp(BinOp::Add, x, Address::Const(Int32(k)))
+                // | TacKind::BinOp(BinOp::Add, Address::Const(Int32(k)), x) => {
+                //     assembly.addi(format!("addi {}, {}, {}", code.target, x, k))
+                // }
 
-                TacKind::Branch => asm.addi(format!("j {}", code.target)),
+                // // add
+                // TacKind::BinOp(BinOp::Add, left, right) => {
+                //     assembly.addi(format!("add {}, {}, {}", code.target, left, right))
+                // }
 
-                TacKind::CBranch(cond, left, right) => asm.addi(format!("b{:?} {}, {}, {}", cond, 
-                    symbol_table.get(left),
-                    symbol_table.get(right)
+                // TacKind::Branch => assembly.addi(format!("j {}", code.target)),
 
-                             code.target)),
+                // TacKind::CBranch(cond, left, right) => assembly.addi(format!(
+                //     "b{:?} {}, {}, {}",
+                //     cond,
+                //     symbol_table.get(left),
+                //     symbol_table.get(right),
+                //     code.target
+                // )),
 
-                TacKind::BinOp(BinOp::Add, left, right) => asm.addi(format!(
-                    "add {}, {}, {}",
-                    code.target,
-                    symbol_table.get(left),
-                    symbol_table.get(right)
-                )),
+                // TacKind::BinOp(BinOp::Add, left, right) => assembly.addi(format!(
+                //     "add {}, {}, {}",
+                //     code.target,
+                //     symbol_table.get(left),
+                //     symbol_table.get(right)
+                // )),
 
-                TacKind::BinOp(BinOp::Sub, left, right) => {
-                    asm.addi(format!("sub {}, {}, {}", code.target, left, right))
-                }
+                // TacKind::BinOp(BinOp::Sub, left, right) => {
+                //     assembly.addi(format!("sub {}, {}, {}", code.target, left, right))
+                // }
 
+                // TacKind::Return(value) => {
+                //     if let Some(v) = value {
+                //         assembly.addi(format!("lw $v0 {}", v));
+                //     } else {
+                //         // do something
+                //     }
+                // }
                 _ => {}
             };
         }
-        asm.into()
     }
 }
+
+// struct Statement {
+//     ir: Tac,
+//     function: Func,
+//     basic_block: BasicBlock,
+// }
 
 #[derive(Default)]
 pub struct Program {
@@ -188,5 +223,8 @@ pub fn compile_prog(ast: NodePtr) -> String {
     //
     // run code gen
 
-    Generator::default().generate(intermediate_code)
+    let mut mips = MipsGenerator::default();
+    mips.generate(intermediate_code);
+
+    mips.asm.into()
 }
