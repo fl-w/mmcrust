@@ -5,20 +5,20 @@ pub mod object;
 use std::{fmt, os::raw::c_int};
 
 use log::{debug, trace};
-use parser::{self, cstr_to_string, BinOp, FnDef, Func, Node, NodePtr, YYTokenType};
+use parser::{self, cstr_to_string, BinOp, Func, FuncDef, Node, NodePtr, YYTokenType};
 
 use self::{
     env::{Env, EnvScope},
     object::Object,
 };
 
+// pub type Env = Envv<Object>;
 pub type EvalResult = Result<Object, EvalError>;
 
 #[derive(Debug)]
 pub enum EvalError {
     Return(Object),
-    /// whether loop should break or continue. if true then break
-    LoopControl(bool),
+    Redeclaration(String),
     DivisionByZero,
     NotCallable(String),
     AssignToLiteral,
@@ -35,6 +35,8 @@ pub enum EvalError {
         expected: YYTokenType,
     },
 
+    /// whether loop should break or continue. if true then break
+    LoopControl(bool),
     /// generic parser error
     ParserError,
 }
@@ -52,6 +54,7 @@ impl fmt::Display for EvalError {
                 }
             ),
             EvalError::Return(value) => write!(f, "Return: {}", value),
+            EvalError::Redeclaration(var) => write!(f, "redeclaration of `{}`", var),
             EvalError::DivisionByZero => write!(f, "DivisionByZero: zero division"),
             EvalError::NotCallable(type_name) => {
                 write!(f, "'{}' object is not callable.", type_name)
@@ -66,7 +69,7 @@ impl fmt::Display for EvalError {
                 "{}() takes {} arguments ({} given)",
                 name, expected, given
             ),
-            EvalError::UnboundVariable(v) => write!(f, "variable '{}' is not defined.", v),
+            EvalError::UnboundVariable(v) => write!(f, "variable `{}` is not defined.", v),
             EvalError::UnsupportedInfixOperation(op, l, r) => write!(
                 f,
                 "unsupported operation: {} {} {} ",
@@ -115,6 +118,7 @@ fn eval_infix_int(infix: &BinOp, left: &c_int, right: &c_int) -> EvalResult {
         BinOp::Add => Ok(Object::Int(left + right)),
         BinOp::Sub => Ok(Object::Int(left - right)),
         BinOp::Mul => Ok(Object::Int(left * right)),
+        BinOp::Mod => Ok(Object::Int(left % right)),
         BinOp::Div => {
             if right == &0 {
                 Err(EvalError::DivisionByZero)
@@ -208,6 +212,7 @@ where
 
 fn eval_fn(closure: Func, scope: EnvScope, args: Vec<Object>, env: &mut Env) -> EvalResult {
     trace!("(eval) {} {:?} with {:?}", scope, closure, args);
+
     eval_block_scope(
         move |block_env| {
             closure
@@ -275,7 +280,7 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
 
             YYTokenType::CONSTANT => Ok(Object::Int(node.as_cint().unwrap())),
 
-            YYTokenType::STRING_LITERAL => Ok(Object::Str(unsafe {
+            YYTokenType::StringLiteral => Ok(Object::Str(unsafe {
                 cstr_to_string(node.as_cstr().unwrap())
             })),
 
@@ -302,7 +307,7 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                     let scope = env.current_scope();
                     let fnc = Func {
                         head: node.right,
-                        def: FnDef {
+                        def: FuncDef {
                             name: name.clone(),
                             return_type,
                             parameters,
@@ -344,14 +349,13 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
             YYTokenType::DECLARE => {
                 if let Some(left_node_type) = node.left_node_token() {
                     match left_node_type {
-                        YYTokenType::LEAF | YYTokenType::INT => {}
+                        YYTokenType::LEAF | YYTokenType::INT => env.declare_next(),
                         _ => {
                             eval_tree(node.left, env)?;
                         }
                     }
                 };
 
-                env.declare_next();
                 let decl = eval_tree(node.right, env)?;
 
                 if let Object::Ident(name) = decl {
@@ -366,6 +370,7 @@ pub fn eval_tree(ptr: NodePtr, env: &mut Env) -> EvalResult {
                     // add to environment
 
                     env.set(name, default_value.clone())?;
+                    env.undeclare_next();
 
                     Ok(default_value)
                 } else {
@@ -422,7 +427,7 @@ pub fn eval_repl(input: &str, env: &mut Env) -> EvalResult {
 }
 
 pub fn eval_prog(ast_root: NodePtr) -> EvalResult {
-    let env = &mut Env::new();
+    let env: &mut Env = &mut Env::new();
 
     eval_tree(ast_root, env)
         .and_then(|_| eval_fn_call(Object::Ident("main".to_owned()), vec![], env))

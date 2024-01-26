@@ -4,7 +4,10 @@
     non_camel_case_types,
     non_snake_case,
     clippy::missing_safety_doc,
-    improper_ctypes
+    improper_ctypes,
+    bad_style,
+    unused,
+    warnings
 )]
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
@@ -20,7 +23,7 @@ pub type Node = NODE;
 pub type NodePtr = *mut Node;
 
 impl Node {
-    fn ptr(self) -> NodePtr { Box::into_raw(Box::new(self)) }
+    pub fn ptr(self) -> NodePtr { Box::into_raw(Box::new(self)) }
 
     pub fn as_cstr(self) -> Option<*mut c_char> {
         (unsafe { (self.ptr() as TokenPtr).as_mut() }).map(|t| t.lexeme)
@@ -144,13 +147,14 @@ pub fn parse() -> Option<NodePtr> {
 
 pub fn node_ptr_null(ptr: NodePtr) -> bool { unsafe { node_is_null(ptr) == 1 || ptr.is_null() } }
 
-#[derive(Debug, Copy, Clone, Hash, Eq, PartialEq)]
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
 pub enum BinOp {
     Add,
     Sub,
     Mul,
     Div,
     Less,
+    Mod,
     Greater,
     LessEqual,
     GreaterEqual,
@@ -170,6 +174,7 @@ impl fmt::Display for BinOp {
                 Sub => "-",
                 Mul => "*",
                 Div => "/",
+                Mod => "%",
                 Less => "<",
                 Greater => ">",
                 LessEqual => "<=",
@@ -181,11 +186,28 @@ impl fmt::Display for BinOp {
     }
 }
 
+impl fmt::Debug for BinOp {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(
+            f,
+            "{}",
+            match self {
+                Add => "add",
+                Sub => "sub",
+                Mul => "mul",
+                Div => "div",
+                Mod => "rem",
+                _ => "",
+            }
+        )
+    }
+}
+
 #[derive(Debug)]
 pub enum YYTokenType {
     IDENTIFIER,
     CONSTANT,
-    STRING_LITERAL,
+    StringLiteral,
     EXTERN,
     AUTO,
     INT,
@@ -217,7 +239,7 @@ impl TryFrom<i32> for YYTokenType {
         match v {
             x if x == IDENTIFIER as i32 => Ok(YYTokenType::IDENTIFIER),
             x if x == CONSTANT as i32 => Ok(YYTokenType::CONSTANT),
-            x if x == STRING_LITERAL as i32 => Ok(YYTokenType::STRING_LITERAL),
+            x if x == STRING_LITERAL as i32 => Ok(YYTokenType::StringLiteral),
             x if x == EXTERN as i32 => Ok(YYTokenType::EXTERN),
             x if x == AUTO as i32 => Ok(YYTokenType::AUTO),
             x if x == INT as i32 => Ok(YYTokenType::INT),
@@ -240,6 +262,7 @@ impl TryFrom<i32> for YYTokenType {
             x if x == '+' as i32 => Ok(YYTokenType::Infix(Add)),
             x if x == '-' as i32 => Ok(YYTokenType::Infix(Sub)),
             x if x == '*' as i32 => Ok(YYTokenType::Infix(Mul)),
+            x if x == '%' as i32 => Ok(YYTokenType::Infix(Mod)),
             x if x == '/' as i32 => Ok(YYTokenType::Infix(Div)),
             x if x == '>' as i32 => Ok(YYTokenType::Infix(Greater)),
             x if x == '<' as i32 => Ok(YYTokenType::Infix(Less)),
@@ -331,8 +354,8 @@ pub fn parse_args(param: NodePtr) -> Vec<NodePtr> {
     arg_list
 }
 
-#[derive(PartialEq, Clone, Default)]
-pub struct FnDef {
+#[derive(PartialEq, Clone, Debug, Default, Eq, Hash)]
+pub struct FuncDef {
     pub name: String,
     pub parameters: Vec<String>,
     pub return_type: String,
@@ -341,7 +364,7 @@ pub struct FnDef {
 #[derive(PartialEq, Clone)]
 pub struct Func {
     pub head: NodePtr,
-    pub def: FnDef,
+    pub def: FuncDef,
 }
 
 impl std::fmt::Debug for Func {
@@ -360,7 +383,7 @@ impl std::fmt::Debug for Func {
 impl Default for Func {
     fn default() -> Self {
         Self {
-            def: FnDef::default(),
+            def: FuncDef::default(),
             head: std::ptr::null_mut() as NodePtr,
         }
     }

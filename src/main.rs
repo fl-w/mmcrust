@@ -1,10 +1,16 @@
-#![feature(or_patterns, in_band_lifetimes, drain_filter, bool_to_option)]
+#![feature(
+    or_patterns,
+    in_band_lifetimes,
+    drain_filter,
+    bool_to_option,
+    trait_alias
+)]
 
 mod codegen;
 mod eval;
 
 use std::{
-    fs::File,
+    fs::OpenOptions,
     io::{Error, Write},
     path::PathBuf,
     process,
@@ -29,8 +35,11 @@ struct Opt {
     /// run repl
     #[argh(switch)]
     repl: bool,
+    /// print tac
+    #[argh(switch)]
+    print_tac: bool,
     /// output file, saves output to file at given path. defaults to {{input}}.s
-    #[argh(option)]
+    #[argh(option, short = 'o')]
     output: Option<PathBuf>,
     /// whether or not to print the parse tree (debug only)
     #[argh(switch)]
@@ -41,6 +50,7 @@ impl Opt {
     fn get_output(&self) -> Result<Box<dyn Write>, Error> {
         let output = &self.output;
         let input = &self.input;
+
         output
             .clone()
             .or_else(|| {
@@ -51,8 +61,15 @@ impl Opt {
                     out
                 })
             })
-            .map(|ref path| File::open(path).map(|f| Box::new(f) as Box<dyn Write>))
-            .unwrap()
+            .map(|ref path| {
+                OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .append(false)
+                    .open(path)
+                    .map(|f| Box::new(f) as Box<dyn Write>)
+            })
+            .unwrap_or_else(|| Ok(Box::new(std::io::stdout())))
             .or_else(|_| Ok(Box::new(std::io::stdout())))
     }
 }
@@ -130,9 +147,7 @@ fn main() {
             exit(exit_code);
         } else {
             let mut output = opt.get_output().unwrap();
-            let prog = codegen::compile_prog(root_node_ptr);
-
-            log::debug!("{}", prog);
+            let prog = codegen::compile_prog(root_node_ptr, opt.print_tac);
 
             writeln!(
                 &mut output,
@@ -155,7 +170,11 @@ fn main() {
 fn read_source_code(input_path: &Option<PathBuf>) -> Option<NodePtr> {
     if let Some(input_path) = input_path {
         if !input_path.is_file() {
-            println!("minus2c: no such file {:?}", input_path);
+            println!(
+                "{}: no such file {:?}",
+                env!("CARGO_CRATE_NAME"),
+                input_path
+            );
             None
         } else {
             let source =

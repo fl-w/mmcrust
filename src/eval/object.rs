@@ -1,7 +1,10 @@
 use parser::Func;
 use std::{fmt, os::raw::c_int};
 
-use super::{builtins::Builtin, env::EnvScope};
+use super::{
+    builtins::{self, Builtin},
+    env::EnvScope,
+};
 
 #[derive(PartialEq, Clone)]
 pub enum Object {
@@ -39,6 +42,14 @@ impl Object {
         }
     }
 }
+
+impl Default for Object {
+    fn default() -> Self { Object::Void }
+}
+
+// impl LookupBuiltin for Object {
+//     fn builtin(builtin: &str) -> Self { builtins::lookup(builtin).expect("builtin not found") }
+// }
 
 impl fmt::Debug for Object {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

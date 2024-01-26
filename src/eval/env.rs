@@ -10,6 +10,7 @@ pub const GLOBAL_SCOPE: EnvScope = 0;
 pub struct Frame {
     extends: EnvScope,
     bindings: HashMap<String, Object>,
+    declare_next: bool,
 }
 
 impl Frame {
@@ -19,14 +20,12 @@ impl Frame {
 #[derive(Debug, PartialEq)]
 pub struct Env {
     frames: Vec<Frame>,
-    declare_next: bool,
 }
 
 impl Env {
     pub fn new() -> Self {
         Self {
             frames: vec![Frame::global()],
-            declare_next: false,
         }
     }
 
@@ -41,18 +40,9 @@ impl Env {
     fn add_frame(&mut self, from_scope: EnvScope) {
         self.frames.push(Frame {
             extends: from_scope,
-            bindings: HashMap::new(),
+            ..Default::default()
         });
     }
-
-    // pub fn extend<F, T>(&mut self, closure: F) -> T
-    // where
-    //     F: FnOnce(&mut Env) -> T,
-    // {
-    //     let scope = self.current_scope();
-
-    //     self.extend_scope(scope, closure)
-    // }
 
     pub fn extend_scope<F, T>(&mut self, scope: EnvScope, closure: F) -> T
     where
@@ -76,18 +66,26 @@ impl Env {
 
     pub fn current_scope(&self) -> EnvScope { self.frames.len() - 1 }
 
-    pub fn declare_next(&mut self) { self.declare_next = true; }
+    fn frame_mut(&mut self) -> &mut Frame { self.frames.last_mut().unwrap() }
 
-    pub fn declare(&mut self, key: String, value: Object) {
-        self.frames.last_mut().unwrap().bindings.insert(key, value);
+    fn frame(&self) -> &Frame { self.frames.last().unwrap() }
+
+    pub fn declare_next(&mut self) { self.frame_mut().declare_next = true; }
+
+    pub fn undeclare_next(&mut self) { self.frame_mut().declare_next = false; }
+
+    pub fn declare(&mut self, key: String, value: Object) -> EvalResult {
+        self.frame_mut()
+            .bindings
+            .insert(key.clone(), value)
+            .map(|_| Err(EvalError::Redeclaration(key)))
+            .unwrap_or(Ok(Object::Void))
     }
 
     pub fn set(&mut self, key: String, value: Object) -> EvalResult {
-        if self.declare_next {
-            self.declare_next = false;
-            self.declare(key, value);
-
-            Ok(Object::Void)
+        if self.frame().declare_next {
+            self.undeclare_next();
+            self.declare(key, value)
         } else if let Some(var) = self.get_mut(&key) {
             let prev = var.clone();
             *var = value;

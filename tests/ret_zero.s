@@ -19,11 +19,7 @@ print_str:
                             
 main:	              
 .ent main           
-     sub $sp, $sp, 4     # add space for locals
-                    
-     ble 2, 4, main_if_exit:                    
-     li $x, 4            # x = 4               
-main_if_exit:       
+     move $v0 0          # move return value to v-reg
                     
      li $v0, 10          # perform exit syscall from spim
      syscall                                 

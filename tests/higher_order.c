@@ -1,19 +1,3 @@
-/* vim: ft=c */
-
-int main() {
-  count = 0;
-  while (x < y) {
-    count = 2 * count;
-    x = x + 1;
-    break;
-  }
-
-  print_str("4 + 0 = ");
-  print_int(cplus4(8));
-  println_str("");
-
-  print_int(fact(3));
-}
 int plus(int a, int b) { return a + b; }
 
 int do(function f, int a, int b) { return f(a, b); }

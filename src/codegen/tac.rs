@@ -1,17 +1,16 @@
 use log::{debug, trace};
 use std::{
     convert::{TryFrom, TryInto},
-    fmt,
+    fmt, mem,
     os::raw::c_int,
 };
 
-use parser::{BinOp, FnDef, Node, NodePtr, YYTokenType};
-use Address::{Const, Name};
+use super::symbol_table::SymbolTable;
+use parser::{BinOp, FuncDef, Node, NodePtr, YYTokenType};
+use Addr::{Const, Name};
 use Constant::*;
 
-use super::Program;
-
-pub type TacSequence = Vec<Tac>;
+pub type Program = Vec<Tac>;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum Constant {
@@ -28,25 +27,53 @@ impl fmt::Display for Constant {
     }
 }
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub enum Address {
+#[derive(Clone, Hash, Eq, PartialEq)]
+pub enum Addr {
     Const(Constant),
     Name(String),
     Temporary(usize),
-    Label(&'static str, usize),
+    Label(String, usize),
 }
 
-impl fmt::Display for Address {
+impl fmt::Display for Addr {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
             "{}",
             match self {
-                Self::Const(int) => int.to_string(),
+                Self::Const(c) => c.to_string(),
                 Self::Name(v) => v.to_string(),
-                // Self::String(v) => format!("\"{}\"", v.to_string(),),
-                Self::Label(prefix, n) => format!("{}{}", prefix, n),
+                Self::Label(prefix, n) => format!(
+                    "{}{}",
+                    prefix,
+                    if *n == 1 {
+                        "".to_owned()
+                    } else {
+                        n.to_string()
+                    }
+                ),
                 Self::Temporary(v) => format!("t{}", v),
+            }
+        )
+    }
+}
+
+impl fmt::Debug for Addr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::Const(Str(s)) => format!("\"{}\"", s),
+                // Self::Name(name) =>
+                //     if name != "main" {
+                //         format!("_{}", name)
+                //     } else {
+                //         name.clone()
+                //     },
+                Self::Label(_, _) => format!("{}:", self),
+                Self::Temporary(v) => format!("$t{}", v),
+                _ => format!("{}", self),
             }
         )
     }
@@ -126,33 +153,76 @@ impl Cond {
 }
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub enum TacKind {
-    Store(Address),
+pub struct CompiledFunction {
+    pub def: FuncDef,
+    pub body: Program,
+    pub end: Addr,
+    pub num_of_temps: usize,
+}
 
-    BinOp(BinOp, Address, Address),
+impl CompiledFunction {
+    pub fn new(end: Addr, def: FuncDef) -> Self {
+        Self {
+            body: Vec::new(),
+            def,
+            end,
+            num_of_temps: 0,
+        }
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        !self
+            .body
+            .iter()
+            .any(|tac| matches!(tac.kind, TacKind::Call(_, _)))
+    }
+
+    pub fn find_locals(&self) -> Vec<String> {
+        self.body
+            .iter()
+            .map(|tac| {
+                tac.ref_addr()
+                    .into_iter()
+                    .filter_map(|addr| {
+                        if let Addr::Name(n) = addr {
+                            Some(n.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<String>>()
+            })
+            .flatten()
+            .collect::<Vec<String>>()
+    }
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub enum TacKind {
+    Store(Addr),
+
+    BinOp(BinOp, Addr, Addr),
 
     BranchTarget,
 
     Branch,
 
-    CBranch(Cond, Address, Address),
+    CBranch(Cond, Addr, Addr),
 
-    ProcBegin(usize),
+    Function(CompiledFunction),
 
-    ProcEnd,
+    Call(Vec<Addr>, Option<Addr>),
 
-    Call(Vec<Address>),
+    Return(Option<Addr>),
 
-    Return(Option<Address>),
-
-    UnaryOp(BinOp, Address),
+    UnaryOp(BinOp, Addr),
 
     Nop, // Closure(Address),
 }
 
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub struct Tac {
-    pub target: Address,
+    pub target: Addr,
     pub kind: TacKind,
 }
 
@@ -181,9 +251,17 @@ impl fmt::Display for Tac {
                 write!(f, "if {}{}{} goto {} ", left, cond, right, dst)
             }
 
-            TacKind::ProcBegin(num_param) => write!(f, "fn begin {} {}", dst, num_param),
-
-            TacKind::ProcEnd => write!(f, "end({})", dst),
+            TacKind::Function(func) => write!(
+                f,
+                "fn begin {} {} \n {} \nend({0})",
+                dst,
+                func.def.parameters.len(),
+                func.body
+                    .iter()
+                    .map(|tac| format!("\t{}", tac.to_string().replace("\n", "\n\t")))
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            ),
 
             TacKind::Return(ref value) => write!(
                 f,
@@ -194,7 +272,7 @@ impl fmt::Display for Tac {
                     .unwrap_or_else(String::new)
             ),
 
-            TacKind::Call(args) => write!(
+            TacKind::Call(args, dest) => writeln!(
                 f,
                 "{}",
                 args.iter()
@@ -202,7 +280,15 @@ impl fmt::Display for Tac {
                     .collect::<Vec<String>>()
                     .join("\n")
             )
-            .and(write!(f, "call {} {}", dst, args.len())),
+            .and(write!(
+                f,
+                "{}call {} {}",
+                dest.clone()
+                    .map(|d| format!("{} = ", d))
+                    .unwrap_or_default(),
+                dst,
+                args.len()
+            )),
 
             Nop => Ok(()),
         }
@@ -214,14 +300,14 @@ impl Into<String> for Tac {
 }
 
 impl Tac {
-    fn new(dst: Address, inst: TacKind) -> Self {
+    fn new(dst: Addr, inst: TacKind) -> Self {
         Self {
             target: dst,
             kind: inst,
         }
     }
 
-    pub fn clone_to(&self, dst: Address) -> Self {
+    pub fn clone_to(&self, dst: Addr) -> Self {
         let mut clone = self.clone();
         clone.target = dst;
 
@@ -231,7 +317,7 @@ impl Tac {
 
 impl Tac {
     /// get mutable vector of all referenced addresses
-    pub fn ref_addr_mut(&mut self) -> Vec<&mut Address> {
+    pub fn ref_addr_mut(&mut self) -> Vec<&mut Addr> {
         let mut ref_addr = vec![&mut self.target];
 
         match self.kind {
@@ -247,7 +333,7 @@ impl Tac {
     }
 
     /// get immutable vector of all referenced addresses
-    pub fn ref_addr(&self) -> Vec<&Address> {
+    pub fn ref_addr(&self) -> Vec<&Addr> {
         let mut ref_addr = vec![&self.target];
 
         match self.kind {
@@ -262,7 +348,7 @@ impl Tac {
         ref_addr
     }
 
-    pub fn has_src(&self, addr: &Address) -> bool {
+    pub fn has_src(&self, addr: &Addr) -> bool {
         println!("self: {:?}, with {:?}", self, addr);
         let dst = &self.target;
 
@@ -272,76 +358,130 @@ impl Tac {
     }
 }
 
+// struct TacTranspilerScope {}
+
 #[derive(Default)]
 struct TacTranspiler {
-    stack: TacSequence,
-    temp_counter: usize,
-    current_loop: Option<(Address, Address)>,
-    current_function: Option<FnDef>,
-    globals: Vec<String>,
+    stack: Program,
+    current_loop: Option<(Addr, Addr)>,
+    current_function: Option<CompiledFunction>,
+    temp_c: usize,
 }
 
 impl TacTranspiler {
-    fn new() -> Self { Self::default() }
+    fn new() -> Self { Default::default() }
 
-    fn last_dst(&self) -> Option<&Address> { self.stack.last().map(|tac| &tac.target) }
+    fn last_dst(&self) -> Option<&Addr> { self.stack().last().map(|tac| &tac.target) }
 
-    fn next_temp(&mut self) -> Address {
-        let addr = Address::Temporary(self.temp_counter);
-        self.temp_counter += 1;
+    fn stack(&self) -> &Program {
+        if let Some(ref func) = self.current_function {
+            &func.body
+        } else {
+            &self.stack
+        }
+    }
+
+    fn stack_mut(&mut self) -> &mut Program {
+        if let Some(ref mut func) = self.current_function {
+            &mut func.body
+        } else {
+            &mut self.stack
+        }
+    }
+
+    fn temp_c(&mut self) -> &mut usize {
+        if let Some(ref mut function) = self.current_function {
+            &mut function.num_of_temps
+        } else {
+            &mut self.temp_c
+        }
+    }
+
+    fn next_temp(&mut self) -> Addr {
+        let temp_counter = self.temp_c();
+        let addr = Addr::Temporary(*temp_counter);
+        *temp_counter += 1;
 
         addr
     }
 
+    fn free_temp(&mut self, addr: &Addr) {
+        if let Addr::Temporary(_) = addr {
+            *self.temp_c() -= 1;
+        }
+    }
+
     /// TODO: maybe keep a hashtable of store of counters?
-    fn next_jump_target(&self, prefix: &'static str) -> Address {
+    fn next_jump_target(&self, suffix: &str) -> Addr {
         let n = self
             .stack
             .iter()
             .filter(|code| match code {
                 Tac {
                     kind: TacKind::BranchTarget,
-                    target: Address::Label(p, _),
-                } => *p == prefix,
+                    target: Addr::Label(p, _),
+                } => *p == suffix,
                 _ => false,
             })
             .count();
 
-        Address::Label(prefix, n + 1)
+        let mut label = if let Some(ref function) = self.current_function {
+            format!("{:?}_", Name(function.def.name.clone()))
+        } else {
+            String::new()
+        };
+
+        label.push_str(suffix);
+
+        Addr::Label(label, n + 1)
     }
 
-    fn add_instruction(&mut self, dst: Address, inst: TacKind) -> &Address {
+    fn add_instruction(&mut self, dst: Addr, inst: TacKind) -> &Addr {
         let code = Tac::new(dst, inst);
 
         debug!("(transpiler) add_inst {}", code);
 
-        self.stack.push(code);
-
+        self.stack_mut().push(code);
         self.last_dst().unwrap()
     }
 
-    fn add_copy(&mut self, src: Address, dst: Address) -> Address {
-        self.stack.push(Tac::new(dst.clone(), TacKind::Store(src)));
+    fn add_copy(&mut self, src: Addr, dst: Addr) -> Addr {
+        // if (dst.)
+        self.stack_mut()
+            .push(Tac::new(dst.clone(), TacKind::Store(src)));
 
         dst
     }
 
-    fn add_assignment(&mut self, node: Node) -> Address {
+    fn add_assignment(&mut self, node: Node) -> Addr {
         let name = node.left_node().and_then(|node| node.as_string()).unwrap();
         let expr = self.walk(node.right_node().unwrap());
 
-        self.add_copy(expr, Name(name))
+        let name = Name(name);
+
+        if let Some(Tac {
+            target,
+            kind: TacKind::Call(a, None),
+        }) = self.stack().last()
+        {
+            if &expr == target {
+                self.stack_mut().last_mut().unwrap().kind = TacKind::Call(a.clone(), Some(name));
+                return expr;
+            }
+        }
+
+        self.add_copy(expr, name)
     }
 
-    fn jump(&mut self, jump_target: &Address) -> &Address {
+    fn jump(&mut self, jump_target: &Addr) -> &Addr {
         self.add_instruction(jump_target.clone(), TacKind::Branch)
     }
 
-    fn add_jump_target(&mut self, jump_target: &Address) -> &Address {
+    fn add_jump_target(&mut self, jump_target: &Addr) -> &Addr {
         self.add_instruction(jump_target.clone(), TacKind::BranchTarget)
     }
 
-    fn add_condition(&mut self, node: Node) -> (Cond, Address, Address) {
+    fn add_condition(&mut self, node: Node) -> (Cond, Addr, Addr) {
         match node.token_type() {
             Some(YYTokenType::Infix(op)) => {
                 let left = self.walk(node.left_node().unwrap());
@@ -358,8 +498,8 @@ impl TacTranspiler {
         }
     }
 
-    fn add_if_block(&mut self, node: Node) -> Address {
-        let jump_target = self.next_jump_target("L");
+    fn add_if_block(&mut self, node: Node) -> Addr {
+        let jump_target = self.next_jump_target("if_exit");
         let (test, left, right) = self.add_condition(node.left_node().unwrap());
 
         self.add_instruction(
@@ -369,20 +509,19 @@ impl TacTranspiler {
         );
 
         if let Some((node, Some(token))) = Node::deref_node_and_token(node.right) {
-            self.walk_tree(node.left);
-
             if let YYTokenType::ELSE = token {
-                let else_jump_target = self.next_jump_target("L");
-
+                let else_jump_target = self.next_jump_target("else_exit");
+                self.walk_tree(node.left);
                 self.jump(&else_jump_target);
                 self.add_jump_target(&jump_target);
 
-                self.walk_tree(node.right);
+                self.walk(node.right_node().unwrap());
 
                 self.add_jump_target(&else_jump_target);
 
                 else_jump_target
             } else {
+                self.walk_tree(node.ptr());
                 self.add_jump_target(&jump_target);
 
                 jump_target
@@ -392,13 +531,13 @@ impl TacTranspiler {
         }
     }
 
-    fn add_while_block(&mut self, node: Node) -> Address {
+    fn add_while_block(&mut self, node: Node) -> Addr {
         let (test, left, right) = self.add_condition(node.left_node().unwrap());
 
-        let loop_start = self.next_jump_target("BWHIILE");
+        let loop_start = self.next_jump_target("while");
         self.add_jump_target(&loop_start);
 
-        let loop_end = self.next_jump_target("AWHILE");
+        let loop_end = self.next_jump_target("while_exit");
         self.add_instruction(
             loop_end.clone(),
             // invert test here for optimal branching
@@ -407,44 +546,81 @@ impl TacTranspiler {
 
         self.current_loop = Some((loop_start.clone(), loop_end.clone()));
 
-        self.walk(node.right_node().unwrap());
-        self.jump(&loop_start);
+        if let Some(right_node) = node.right_node() {
+            self.walk(right_node);
+            self.jump(&loop_start);
+        }
 
         self.add_jump_target(&loop_end);
 
         loop_end
     }
 
-    fn add_fn(&mut self, node: Node) -> Address {
+    fn add_fn(&mut self, node: Node) -> Addr {
         // parser shouldn't allow any other case. but
         // if let here to be safe
         if let Some((def, YYTokenType::d)) = node.left_node_and_token() {
-            // let return_type = def.left_node().and_then(Node::as_string).unwrap();
+            let return_type = def.left_node().and_then(Node::as_string).unwrap();
             let (name, parameters) = parser::parse_fn(def.right_node().unwrap());
 
-            log::debug!("{} {:?}", name, parameters);
+            log::debug!("add_fn {} {:?}", name, parameters);
 
-            let name_addr = Address::Name(name);
+            let name_addr = Addr::Name(name.clone());
+            let function = CompiledFunction::new(
+                Addr::Temporary(0),
+                FuncDef {
+                    parameters,
+                    return_type,
+                    name,
+                },
+            );
 
-            self.add_instruction(name_addr.clone(), TacKind::ProcBegin(parameters.len()));
+            let outer_function = self.current_function.replace(function);
+            let end = self.next_jump_target("return");
+            if let Some(ref mut f) = self.current_function {
+                f.end = end;
+            }
 
             self.walk_tree(node.right); // walk function body
 
-            self.add_instruction(name_addr.clone(), TacKind::ProcEnd);
+            let function = mem::replace(&mut self.current_function, outer_function);
 
+            self.add_instruction(name_addr.clone(), TacKind::Function(function.unwrap()));
             name_addr
         } else {
             panic!("parse error")
         }
     }
+    pub fn last_inst_is_call(&self) -> bool {
+        matches!(
+            self.stack.last(),
+            Some(Tac {
+                target: _,
+                kind: TacKind::Call(_, None),
+            })
+        )
+    }
 
-    pub fn add_call(&mut self, node: Node) -> Address {
+    pub fn add_call(&mut self, node: Node) -> Addr {
         let name = self.walk(node.left_node().unwrap());
-        let args: Vec<Address> = parser::parse_args(node.right)
+        let args: Vec<Addr> = parser::parse_args(node.right)
             .into_iter()
             .map(TryInto::try_into)
             .filter_map(Result::ok)
-            .map(|arg: Node| self.walk(arg))
+            .map(|arg: Node| {
+                let mut addr = self.walk(arg);
+                self.free_temp(&addr);
+
+                if self.last_inst_is_call() {
+                    addr = self.next_temp();
+                    let tac = self.stack_mut().last_mut().unwrap();
+                    if let TacKind::Call(_, ref mut dest) = &mut tac.kind {
+                        dest.replace(addr.clone());
+                    };
+                }
+
+                addr
+            })
             .collect();
 
         trace!(
@@ -456,10 +632,11 @@ impl TacTranspiler {
                 .join(", ")
         );
 
-        self.add_instruction(name, TacKind::Call(args)).clone()
+        self.add_instruction(name, TacKind::Call(args, None))
+            .clone()
     }
 
-    fn add_return(&mut self, node: Node) -> Address {
+    fn add_return(&mut self, node: Node) -> Addr {
         let value = if let Some(left_node) = node.left_node() {
             Some(self.walk(left_node))
         } else {
@@ -470,7 +647,7 @@ impl TacTranspiler {
             .clone()
     }
 
-    fn add_decl(&mut self, node: Node) -> Address {
+    fn add_decl(&mut self, node: Node) -> Addr {
         let addr = self.walk(node.left_node().unwrap());
 
         // let is_global = self.current_function.is_none();
@@ -487,15 +664,18 @@ impl TacTranspiler {
         }
     }
 
-    fn add_expr(&mut self, node: Node, op: BinOp) -> Address {
+    fn add_expr(&mut self, node: Node, op: BinOp) -> Addr {
         let left_node = node.left_node().unwrap();
         let src_left = self.walk(left_node);
 
         let inst = if let Some(right_node) = node.right_node() {
             let src_right = self.walk(right_node);
+            self.free_temp(&src_left);
+            self.free_temp(&src_right);
 
             TacKind::BinOp(op, src_left, src_right)
         } else {
+            self.free_temp(&src_left);
             TacKind::UnaryOp(op, src_left)
         };
 
@@ -503,7 +683,7 @@ impl TacTranspiler {
         self.add_instruction(dst, inst).clone()
     }
 
-    fn add_loop_jump(&mut self, break_or_continue: &str) -> Address {
+    fn add_loop_jump(&mut self, break_or_continue: &str) -> Addr {
         let (start, end) = match &self.current_loop {
             Some((start, end)) => (start.clone(), end.clone()),
             _ => panic!("compiler error: break statement out of loop"),
@@ -524,7 +704,7 @@ impl TacTranspiler {
     /// - generate labels/address needed
     /// - generate tac code for that node
     /// - add tac to growing list.
-    fn walk(&mut self, node: Node) -> Address {
+    fn walk(&mut self, node: Node) -> Addr {
         if let Some(token) = node.token_type() {
             trace!(
                 "walking at {:?} with token {:?} ({})",
@@ -536,7 +716,7 @@ impl TacTranspiler {
             match token {
                 YYTokenType::INT => Name("int".to_owned()),
                 YYTokenType::CONSTANT => Const(Int32(node.as_cint().unwrap())),
-                YYTokenType::STRING_LITERAL => Const(Str(node.as_string().unwrap())),
+                YYTokenType::StringLiteral => Const(Str(node.as_string().unwrap())),
                 YYTokenType::IDENTIFIER => Name(node.as_string().unwrap()),
                 YYTokenType::BREAK => self.add_loop_jump("break"),
                 YYTokenType::CONTINUE => self.add_loop_jump("continue"),
@@ -572,7 +752,7 @@ impl TacTranspiler {
     // result.push_str(format!("\n    .globl    {}\n    .type {}, @function\n\n", fnc.name.clone(), fnc.name.clone()).as_str());
 }
 
-pub fn transpile_ast(ast_root: NodePtr) -> TacSequence {
+pub fn transpile_ast(ast_root: NodePtr) -> Program {
     let mut transpiler = TacTranspiler::new();
 
     transpiler.walk_tree(ast_root);

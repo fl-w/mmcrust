@@ -1,14 +1,13 @@
-use super::tac::Address::*;
-use super::tac::{Address, Inst, TacSequence, ThreeAddressCode};
+use super::tac::{Addr, Constant, Program, Tac, TacKind};
 use itertools::Itertools;
 use log::{debug, trace};
 use parser::*;
 use std::collections::HashMap;
 
-use Infix::{Add, Divide, Multiply, Subtract};
+use BinOp::{Add, Div, Mul, Sub};
 
 #[derive(Default)]
-pub struct BasicBlock(TacSequence);
+pub struct BasicBlock(Program);
 
 impl std::fmt::Debug for BasicBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -16,18 +15,18 @@ impl std::fmt::Debug for BasicBlock {
     }
 }
 
-impl From<TacSequence> for BasicBlock {
-    fn from(tacs: TacSequence) -> Self { Self(tacs) }
+impl From<Program> for BasicBlock {
+    fn from(tacs: Program) -> Self { Self(tacs) }
 }
 
 impl BasicBlock {
-    pub fn new(prog: TacSequence) -> Self { Self(prog) }
+    pub fn new(prog: Program) -> Self { Self(prog) }
 
-    pub fn into_code(self) -> TacSequence { self.0 }
+    pub fn into_code(self) -> Program { self.0 }
 
-    pub fn code(&self) -> &TacSequence { &self.0 }
+    pub fn code(&self) -> &Program { &self.0 }
 
-    pub fn code_mut(&mut self) -> &mut TacSequence { &mut self.0 }
+    pub fn code_mut(&mut self) -> &mut Program { &mut self.0 }
 
     pub fn optimize(&mut self) {
         let mut check = false;
@@ -72,7 +71,7 @@ impl BasicBlock {
             .map(|tac| tac.ref_addr_mut())
             .flatten()
             .for_each(|addr| {
-                if let Address::Temporary(ref mut i) = addr {
+                if let Addr::Temporary(ref mut i) = addr {
                     if let Some(replacement) = order.get(&i) {
                         *i = *replacement;
                     } else {
@@ -86,25 +85,29 @@ impl BasicBlock {
 
     fn fold_constants(&mut self) {
         self.code_mut().iter_mut().for_each(|tac| {
-            if let Inst::BinOp(ref op, ref left, ref right) = tac.inst {
+            if let TacKind::BinOp(ref op, ref left, ref right) = tac.kind {
                 let src = match (op, left, right) {
-                    (Add | Subtract, a, Const(0))
-                    | (Add | Subtract, Const(0), a)
-                    | (Multiply | Divide, a, Const(1))
-                    | (Multiply | Divide, Const(1), a) => a.clone(),
+                    (Add | Sub, a, Addr::Const(Constant::Int32(0)))
+                    | (Add | Sub, Addr::Const(Constant::Int32(0)), a)
+                    | (Mul | Div, a, Addr::Const(Constant::Int32(1)))
+                    | (Mul | Div, Addr::Const(Constant::Int32(1)), a) => a.clone(),
 
-                    (Add | Subtract | Divide | Multiply, Const(a), Const(b)) => Const(match op {
+                    (
+                        Add | Sub | Div | Mul,
+                        Addr::Const(Constant::Int32(a)),
+                        Addr::Const(Constant::Int32(b)),
+                    ) => Addr::Const(Constant::Int32(match op {
                         Add => a + b,
-                        Subtract => a - b,
-                        Multiply => a * b,
-                        Divide => a / b,
+                        Sub => a - b,
+                        Mul => a * b,
+                        Div => a / b,
                         _ => unreachable!(),
-                    }),
+                    })),
 
                     _ => return,
                 };
 
-                tac.inst = Inst::Copy(src);
+                tac.kind = TacKind::Store(src);
             }
         });
     }
@@ -118,21 +121,21 @@ impl BasicBlock {
                 .collect::<Vec<String>>()
                 .join("\n")
         );
-        self.0 = self.code_mut().iter_mut().rfold(
-            Vec::new(),
-            |mut code: Vec<ThreeAddressCode>, inst| {
-                let t = code.iter().any(|tac| tac.has_src(&inst.dst));
+        self.0 = self
+            .code_mut()
+            .iter_mut()
+            .rfold(Vec::new(), |mut code: Vec<Tac>, kind| {
+                let t = code.iter().any(|tac| tac.has_src(&kind.target));
 
-                println!("{} {} code: {:?}", inst.dst, t, code);
+                println!("{} {} code: {:?}", kind.target, t, code);
 
-                if matches!(inst.dst, Address::Name(_)) || t {
-                    println!("inserting {:?}", inst);
-                    code.insert(0, inst.clone());
+                if matches!(kind.target, Addr::Name(_)) || t {
+                    println!("inserting {:?}", kind);
+                    code.insert(0, kind.clone());
                 }
 
                 code
-            },
-        );
+            });
     }
 
     fn elim_common_binops(&mut self) {
@@ -140,13 +143,13 @@ impl BasicBlock {
 
         let common_expr = code.iter().enumerate().fold(
             HashMap::new(),
-            |mut common_expr: HashMap<Inst, (Vec<usize>, ThreeAddressCode)>, (index, tac)| {
-                if let Inst::BinOp(_, _, _) = tac.inst {
-                    if let Some((arr, _)) = common_expr.get_mut(&tac.inst) {
+            |mut common_expr: HashMap<TacKind, (Vec<usize>, Tac)>, (index, tac)| {
+                if let TacKind::BinOp(_, _, _) = tac.kind {
+                    if let Some((arr, _)) = common_expr.get_mut(&tac.kind) {
                         arr.push(index);
                     } else {
                         let tac = tac.clone();
-                        common_expr.insert(tac.inst.clone(), (vec![index], tac));
+                        common_expr.insert(tac.kind.clone(), (vec![index], tac));
                     }
                 }
 
@@ -155,23 +158,23 @@ impl BasicBlock {
         );
 
         for (_, (indexes, common_expr)) in common_expr {
-            let expr = common_expr.clone_to(Address::Temporary(code.len()));
+            let expr = common_expr.clone_to(Addr::Temporary(code.len()));
 
             for index in indexes {
                 let tac = code.get_mut(index).unwrap();
 
-                if let Inst::BinOp(op, left, right) = &tac.inst {
-                    *tac = expr.clone_to(tac.dst.clone());
+                if let TacKind::BinOp(op, left, right) = &tac.kind {
+                    *tac = expr.clone_to(tac.target.clone());
                 }
             }
         }
     }
 
     fn propagate_copy(&mut self) {
-        let mut copies: HashMap<Address, Address> = HashMap::new();
+        let mut copies: HashMap<Addr, Addr> = HashMap::new();
         for code in self.code_mut().iter_mut() {
-            match code.inst {
-                Inst::BinOp(_, ref mut left, ref mut right) => {
+            match code.kind {
+                TacKind::BinOp(_, ref mut left, ref mut right) => {
                     for src in vec![left, right] {
                         if let Some(copy) = copies.get(&src) {
                             *src = copy.clone();
@@ -179,18 +182,18 @@ impl BasicBlock {
                     }
                 }
 
-                Inst::UnaryOp(_, ref mut src) => {
+                TacKind::UnaryOp(_, ref mut src) => {
                     if let Some(copy) = copies.get(&src) {
                         *src = copy.clone();
                     }
                 }
 
-                Inst::Copy(ref mut src) => {
+                TacKind::Store(ref mut src) => {
                     if let Some(copy) = copies.get(&src) {
                         *src = copy.clone();
                     }
 
-                    copies.insert(code.dst.clone(), src.clone());
+                    copies.insert(code.target.clone(), src.clone());
                 }
 
                 _ => (),
@@ -199,14 +202,14 @@ impl BasicBlock {
     }
 }
 
-pub fn into_basic_blocks(prog: TacSequence) -> Vec<BasicBlock> {
+pub fn into_basic_blocks(prog: Program) -> Vec<BasicBlock> {
     let mut last = 0;
     let mut blocks = Vec::new();
 
     for leader in prog
         .iter()
         .enumerate()
-        .filter(|(_, t)| matches!(t.inst, Inst::BranchTarget | Inst::CBranch(_, _, _) ))
+        .filter(|(_, t)| matches!(t.kind, TacKind::BranchTarget | TacKind::CBranch(_, _, _) ))
         .map(|(i, _)| i)
     {
         println!("index: {}..{}", last, leader);
@@ -223,7 +226,7 @@ pub fn into_basic_blocks(prog: TacSequence) -> Vec<BasicBlock> {
         .collect::<Vec<BasicBlock>>()
 }
 
-pub fn optimize(prog: TacSequence) -> TacSequence {
+pub fn optimize(prog: Program) -> Program {
     debug!("starting optimisation with {:#?}", prog);
 
     let mut blocks = into_basic_blocks(prog);
@@ -243,5 +246,5 @@ pub fn optimize(prog: TacSequence) -> TacSequence {
         .into_iter()
         .map(BasicBlock::into_code)
         .flatten()
-        .collect::<TacSequence>()
+        .collect::<Program>()
 }
